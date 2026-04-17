@@ -111,7 +111,7 @@ def _in_chop(ts_utc: datetime) -> bool:
 def run_backtest(print_report: bool = True) -> dict:
     load_dotenv()
     client = StockHistoricalDataClient(
-        os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
+        os.environ["ALPACA_API_KEY"].strip(), os.environ["ALPACA_SECRET_KEY"].strip()
     )
     equity = float(os.environ.get("BACKTEST_EQUITY", "953000"))
     daily_loss_cap = -equity * DAILY_LOSS_LIMIT_PCT

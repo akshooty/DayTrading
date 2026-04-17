@@ -30,8 +30,8 @@ st.set_page_config(page_title="Breakout Trader", page_icon="📈", layout="wide"
 @st.cache_resource
 def alpaca_client() -> TradingClient:
     return TradingClient(
-        os.environ["ALPACA_API_KEY"],
-        os.environ["ALPACA_SECRET_KEY"],
+        os.environ["ALPACA_API_KEY"].strip(),
+        os.environ["ALPACA_SECRET_KEY"].strip(),
         paper=True,
     )
 
@@ -71,7 +71,14 @@ def fetch_positions():
 
 
 @st.cache_data(ttl=30)
-def fetch_orders(days: int = 7):
+def fetch_trades(days: int = 30):
+    """Pair filled orders into round-trip trades (entry + exit) and
+    compute per-trade P&L, duration, and cumulative stats.
+
+    Assumes at most one open position per symbol at any time (which is
+    the bot's design invariant). For positions still open, the trade is
+    returned with exit fields blank.
+    """
     c = alpaca_client()
     after = datetime.now(EASTERN) - timedelta(days=days)
     req = GetOrdersRequest(
@@ -80,21 +87,61 @@ def fetch_orders(days: int = 7):
         limit=500,
     )
     orders = c.get_orders(req)
-    rows = []
-    for o in orders:
-        rows.append({
-            "submitted_at": o.submitted_at.astimezone(EASTERN) if o.submitted_at else None,
-            "filled_at": o.filled_at.astimezone(EASTERN) if o.filled_at else None,
-            "symbol": o.symbol,
-            "side": str(o.side).split(".")[-1].lower(),
-            "type": str(o.order_type).split(".")[-1].lower(),
-            "qty": float(o.qty) if o.qty else 0,
-            "filled_qty": float(o.filled_qty) if o.filled_qty else 0,
-            "filled_avg_price": float(o.filled_avg_price) if o.filled_avg_price else None,
-            "status": str(o.status).split(".")[-1].lower(),
-            "order_class": str(o.order_class).split(".")[-1].lower() if o.order_class else "",
+    filled = [
+        o for o in orders
+        if str(o.status).split(".")[-1].lower() == "filled" and o.filled_at
+    ]
+    filled.sort(key=lambda o: o.filled_at)
+
+    trades = []
+    open_pos: dict[str, dict] = {}
+
+    for o in filled:
+        sym = o.symbol
+        side = str(o.side).split(".")[-1].lower()
+        qty = float(o.filled_qty or 0)
+        price = float(o.filled_avg_price or 0)
+        t = o.filled_at.astimezone(EASTERN)
+
+        if sym not in open_pos:
+            direction = "long" if side.endswith("buy") else "short"
+            open_pos[sym] = {
+                "entry_at": t, "entry_price": price, "qty": qty,
+                "direction": direction,
+            }
+        else:
+            ent = open_pos.pop(sym)
+            if ent["direction"] == "long":
+                pnl = (price - ent["entry_price"]) * min(qty, ent["qty"])
+            else:
+                pnl = (ent["entry_price"] - price) * min(qty, ent["qty"])
+            trades.append({
+                "entry_at": ent["entry_at"],
+                "exit_at": t,
+                "symbol": sym,
+                "direction": ent["direction"],
+                "qty": ent["qty"],
+                "entry_price": ent["entry_price"],
+                "exit_price": price,
+                "pnl": pnl,
+                "duration_min": (t - ent["entry_at"]).total_seconds() / 60,
+                "status": "closed",
+            })
+
+    for sym, ent in open_pos.items():
+        trades.append({
+            "entry_at": ent["entry_at"],
+            "exit_at": None,
+            "symbol": sym,
+            "direction": ent["direction"],
+            "qty": ent["qty"],
+            "entry_price": ent["entry_price"],
+            "exit_price": None,
+            "pnl": None,
+            "duration_min": None,
+            "status": "open",
         })
-    return rows
+    return trades
 
 
 @st.cache_data(ttl=300)
@@ -130,24 +177,102 @@ tab_trades, tab_positions, tab_scanner, tab_insights = st.tabs(
 
 # ----- TRADES TAB -----
 with tab_trades:
-    st.subheader("Orders — Last 7 Days")
-    rows = fetch_orders(days=7)
-    if not rows:
-        st.info("No orders found in the last 7 days.")
+    days_back = st.slider("Lookback (days)", 1, 90, 30, 1)
+    trades = fetch_trades(days=days_back)
+    if not trades:
+        st.info("No trades found in this window. Once the bot runs live (DRY_RUN=0), round-trip trades will show here.")
     else:
-        df = pd.DataFrame(rows)
-        df["submitted_at"] = df["submitted_at"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M") if x else "")
-        df["filled_at"] = df["filled_at"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M") if x else "")
-        filled = df[df["status"] == "filled"].copy()
+        df = pd.DataFrame(trades)
+        closed = df[df["status"] == "closed"].copy()
+        closed = closed.sort_values("entry_at")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total orders", len(df))
-        c2.metric("Filled", len(filled))
-        c3.metric("Open", (df["status"].isin(["new", "accepted", "held", "partially_filled"])).sum())
+        # Summary metrics
+        total_pnl = closed["pnl"].sum() if not closed.empty else 0
+        wins = closed[closed["pnl"] > 0]
+        losses = closed[closed["pnl"] < 0]
+        win_rate = (len(wins) / len(closed) * 100) if len(closed) else 0
+        avg_win = wins["pnl"].mean() if not wins.empty else 0
+        avg_loss = losses["pnl"].mean() if not losses.empty else 0
+        largest_win = wins["pnl"].max() if not wins.empty else 0
+        largest_loss = losses["pnl"].min() if not losses.empty else 0
+        avg_duration = closed["duration_min"].mean() if not closed.empty else 0
+
+        # Drawdown from cumulative P&L
+        if not closed.empty:
+            cum = closed["pnl"].cumsum()
+            running_peak = cum.cummax()
+            drawdown = cum - running_peak
+            max_dd = drawdown.min()
+        else:
+            cum = pd.Series(dtype=float)
+            max_dd = 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Closed trades", len(closed))
+        c2.metric("Realized P&L", f"${total_pnl:+,.2f}")
+        c3.metric("Win rate", f"{win_rate:.1f}%", f"{len(wins)}W / {len(losses)}L")
+        c4.metric("Max drawdown", f"${max_dd:,.2f}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Avg win", f"${avg_win:+,.2f}")
+        c6.metric("Avg loss", f"${avg_loss:+,.2f}")
+        c7.metric("Largest win", f"${largest_win:+,.2f}")
+        c8.metric("Avg duration", f"{avg_duration:.1f} min")
+
+        # Equity curve (cumulative realized P&L)
+        if not closed.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=closed["exit_at"],
+                y=cum.values,
+                mode="lines+markers",
+                name="Cumulative P&L",
+                line=dict(color="#1f77b4"),
+            ))
+            fig.add_trace(go.Scatter(
+                x=closed["exit_at"],
+                y=drawdown.values,
+                mode="lines",
+                name="Drawdown",
+                line=dict(color="#d62728", dash="dot"),
+                yaxis="y2",
+            ))
+            fig.update_layout(
+                height=320,
+                margin=dict(l=0, r=0, t=30, b=0),
+                yaxis=dict(title="Cumulative P&L ($)"),
+                yaxis2=dict(title="Drawdown ($)", overlaying="y", side="right"),
+                legend=dict(orientation="h", y=1.08),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Per-trade table
+        st.subheader("Round-trip trades")
+        open_count = (df["status"] == "open").sum()
+        if open_count:
+            st.caption(f"{open_count} currently-open position(s) also listed below with blank exit fields.")
+
+        disp = df.copy()
+        disp["entry"] = disp.apply(
+            lambda r: f"{r['entry_at'].strftime('%m-%d %H:%M')} @ ${r['entry_price']:.2f}"
+            if r["entry_at"] else "", axis=1,
+        )
+        disp["exit"] = disp.apply(
+            lambda r: f"{r['exit_at'].strftime('%m-%d %H:%M')} @ ${r['exit_price']:.2f}"
+            if r["exit_at"] and r["exit_price"] else "—",
+            axis=1,
+        )
+        disp["duration"] = disp["duration_min"].apply(
+            lambda x: f"{x:.0f}m" if pd.notna(x) else "—"
+        )
+        disp["pnl_str"] = disp["pnl"].apply(
+            lambda x: f"${x:+,.2f}" if pd.notna(x) else "—"
+        )
 
         st.dataframe(
-            df[["submitted_at", "symbol", "side", "type", "qty", "filled_qty",
-                "filled_avg_price", "status", "order_class"]],
+            disp[["symbol", "direction", "qty", "entry", "exit", "duration", "pnl_str", "status"]]
+                .rename(columns={"pnl_str": "P&L"})
+                .sort_values("entry", ascending=False),
             use_container_width=True,
             hide_index=True,
         )

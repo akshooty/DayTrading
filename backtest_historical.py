@@ -39,15 +39,17 @@ def prior_trading_day(d: date) -> date:
     return p
 
 
-def find_movers(target_date: date) -> tuple[list[dict], list[dict]]:
+def fetch_daily_bars(start_date: date, end_date: date) -> dict[str, list]:
+    """Fetch daily bars for all tradable US equities over a date range.
+    Used once upfront to avoid re-fetching per-day in multi-day backtests.
+    """
     load_dotenv()
     dclient = StockHistoricalDataClient(
-        os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
+        os.environ["ALPACA_API_KEY"].strip(), os.environ["ALPACA_SECRET_KEY"].strip()
     )
     tclient = TradingClient(
-        os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"], paper=True
+        os.environ["ALPACA_API_KEY"].strip(), os.environ["ALPACA_SECRET_KEY"].strip(), paper=True
     )
-
     assets = tclient.get_all_assets(GetAssetsRequest(
         status=AssetStatus.ACTIVE,
         asset_class=AssetClass.US_EQUITY,
@@ -56,15 +58,14 @@ def find_movers(target_date: date) -> tuple[list[dict], list[dict]]:
         a.symbol for a in assets
         if a.tradable and a.symbol and a.symbol.isalnum()
     ]
-    print(f"universe: {len(symbols)} tradable US equities")
+    print(f"universe: {len(symbols)} tradable US equities", flush=True)
 
-    prev = prior_trading_day(target_date)
-    start = datetime.combine(prev, time(0, 0), tzinfo=EASTERN)
-    end = datetime.combine(target_date + timedelta(days=1), time(0, 0), tzinfo=EASTERN)
-
+    start = datetime.combine(start_date, time(0, 0), tzinfo=EASTERN)
+    end = datetime.combine(end_date + timedelta(days=1), time(0, 0), tzinfo=EASTERN)
     feed = DataFeed[os.environ.get("FEED", "IEX").upper()]
+
     all_bars: dict[str, list] = {}
-    chunk = 1000
+    chunk = 500
     for i in range(0, len(symbols), chunk):
         batch = symbols[i:i + chunk]
         try:
@@ -77,15 +78,19 @@ def find_movers(target_date: date) -> tuple[list[dict], list[dict]]:
             for sym, bars in resp.data.items():
                 all_bars[sym] = bars
         except Exception as e:
-            print(f"  chunk {i}-{i+chunk} failed: {e}", file=sys.stderr)
-    print(f"got daily bars for {len(all_bars)} symbols")
+            print(f"  chunk {i}-{i+chunk} failed: {e}", file=sys.stderr, flush=True)
+        print(f"  fetched {i+len(batch)}/{len(symbols)} symbols", flush=True)
+    print(f"got daily bars for {len(all_bars)} symbols", flush=True)
+    return all_bars
 
+
+def movers_from_cache(target_date: date, all_bars: dict[str, list]) -> tuple[list[dict], list[dict]]:
+    prev = prior_trading_day(target_date)
     gainers: list[dict] = []
     losers: list[dict] = []
     for sym, bars in all_bars.items():
         if len(bars) < 2:
             continue
-        # Find bar for target_date and prev
         by_date = {b.timestamp.astimezone(EASTERN).date(): b for b in bars}
         if target_date not in by_date or prev not in by_date:
             continue
@@ -102,10 +107,17 @@ def find_movers(target_date: date) -> tuple[list[dict], list[dict]]:
             gainers.append(row)
         elif change <= -MIN_CHANGE_PCT:
             losers.append(row)
-
     gainers.sort(key=lambda r: -r["Change"])
     losers.sort(key=lambda r: r["Change"])
     return gainers[:TOP_N], losers[:TOP_N]
+
+
+def find_movers(target_date: date) -> tuple[list[dict], list[dict]]:
+    """Single-date convenience wrapper — fetches daily bars for just
+    target_date and its prior trading day, then extracts movers."""
+    prev = prior_trading_day(target_date)
+    all_bars = fetch_daily_bars(prev, target_date)
+    return movers_from_cache(target_date, all_bars)
 
 
 def main() -> int:

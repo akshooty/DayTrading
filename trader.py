@@ -63,8 +63,8 @@ class BreakoutTrader:
     def __init__(self, dry_run: bool = False):
         load_dotenv()
         self.dry_run = dry_run
-        key = os.environ["ALPACA_API_KEY"]
-        secret = os.environ["ALPACA_SECRET_KEY"]
+        key = os.environ["ALPACA_API_KEY"].strip()
+        secret = os.environ["ALPACA_SECRET_KEY"].strip()
         self.trading = TradingClient(key, secret, paper=True)
         self.data_stream = StockDataStream(key, secret)
         self.trade_stream = TradingStream(key, secret, paper=True)
