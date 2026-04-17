@@ -53,6 +53,7 @@ CHOP_END = time(14, 0)
 RISK_PCT = 0.005
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
+MAX_RISK_PER_TRADE = 200.0
 LIMIT_OFFSET = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.01
 
@@ -138,6 +139,7 @@ class BreakoutTrader:
         qty = position_size(
             self.equity, RISK_PCT, s.entry, s.stop,
             max_deployment=MAX_DEPLOYMENT,
+            max_risk=MAX_RISK_PER_TRADE,
         )
         if qty <= 0:
             log.warning("%s ARM skipped — qty 0", s.symbol)

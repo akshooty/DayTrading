@@ -45,6 +45,7 @@ EASTERN = ZoneInfo("America/New_York")
 RISK_PCT = 0.005
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
+MAX_RISK_PER_TRADE = 200.0
 CHOP_START = time(11, 30)
 CHOP_END = time(14, 0)
 DAILY_LOSS_LIMIT_PCT = 0.01
@@ -180,6 +181,7 @@ def run_backtest():
                 qty = position_size(
                     equity, RISK_PCT, sig.entry, sig.stop,
                     max_deployment=MAX_DEPLOYMENT,
+                    max_risk=MAX_RISK_PER_TRADE,
                 )
                 if qty >= 2:  # need at least 2 to split 50/50
                     initial_risk = max(abs(fill - sig.stop), min_stop_dist(fill))

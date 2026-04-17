@@ -260,10 +260,17 @@ def position_size(
     stop: float,
     min_stop_distance: float | None = None,
     max_deployment: float = 5000.0,
+    max_risk: float = 200.0,
 ) -> int:
+    """Size a position so that IF the initial stop hits, the loss is
+    bounded by BOTH the 0.5%-of-equity budget AND a hard $200 cap.
+
+    Also bounded by max_deployment ($ notional) to keep low-priced names
+    from blowing up share counts.
+    """
     if min_stop_distance is None:
         min_stop_distance = min_stop_dist(entry)
-    risk_dollars = equity * risk_pct
+    risk_dollars = min(equity * risk_pct, max_risk)
     stop_dist = max(abs(entry - stop), min_stop_distance)
     qty_from_risk = risk_dollars / stop_dist
     qty_from_cap = max_deployment / entry if entry > 0 else 0.0
