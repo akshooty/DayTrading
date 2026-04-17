@@ -1,9 +1,16 @@
-"""Breakout-long live trader.
+"""Breakout-long + breakout-short live trader.
 
-Runs during regular US market hours. EOD closeout ~2:55 PM CT, then exits.
-Launched by launchd at ~8:25 AM CT weekdays.
+Subscribes to Alpaca 1-min bars for today's gainers (LONG candidates)
+and losers (SHORT candidates), drives per-symbol state machines, and
+submits stop-limit entries + trailing-stop exits on Alpaca paper.
 
-Set DRY_RUN=1 to log signals without placing orders.
+Runs during regular US session; EOD closeout at 2:55 PM CT.
+Launched by launchd at 8:25 AM CT weekdays.
+
+Env flags:
+  DRY_RUN=1     disable order submission (log only)
+  WATCHLIST=... comma-separated long-only ticker override for testing
+  LOG_LEVEL=... DEBUG|INFO (default INFO)
 """
 
 from __future__ import annotations
@@ -24,11 +31,14 @@ from alpaca.trading.requests import (
 from alpaca.trading.stream import TradingStream
 from dotenv import load_dotenv
 
-from scanner import scan as finviz_scan
+from scanner import scan_gainers, scan_losers
 from strategy import (
     ArmSignal,
     Bar,
     BreakoutLongState,
+    BreakoutShortState,
+    BreakoutState,
+    Direction,
     ResetSignal,
     State,
     position_size,
@@ -39,7 +49,8 @@ EOD_EXIT_ET = time(15, 55)
 
 RISK_PCT = 0.005
 MIN_STOP_DIST = 0.10
-MAX_CONCURRENT = 5
+MAX_CONCURRENT = 8
+MAX_DEPLOYMENT = 5000.0
 LIMIT_OFFSET = 0.05
 
 log = logging.getLogger("trader")
@@ -54,36 +65,45 @@ class BreakoutTrader:
         self.trading = TradingClient(key, secret, paper=True)
         self.data_stream = StockDataStream(key, secret)
         self.trade_stream = TradingStream(key, secret, paper=True)
-        self.states: dict[str, BreakoutLongState] = {}
+        self.states: dict[str, BreakoutState] = {}
         self.entry_orders: dict[str, str] = {}
         self.open_positions: set[str] = set()
         self.equity: float = 0.0
 
-    def load_watchlist(self) -> list[str]:
+    def load_watchlist(self) -> dict[str, Direction]:
+        def valid(s: str) -> bool:
+            return bool(s) and s.isalnum()
+
         override = os.environ.get("WATCHLIST")
         if override:
-            tickers = [s.strip().upper() for s in override.split(",") if s.strip()]
-            log.info("watchlist from env (%d): %s", len(tickers), tickers)
-            return tickers
-        results = finviz_scan()
-        tickers = [r["Ticker"] for r in results if r.get("Ticker")]
-        log.info("watchlist from finviz (%d): %s", len(tickers), tickers)
-        return tickers
+            syms = {s.strip().upper(): Direction.LONG for s in override.split(",") if valid(s.strip().upper())}
+            log.info("watchlist from env (%d, all LONG): %s", len(syms), list(syms))
+            return syms
+        gainers = [r["Ticker"] for r in scan_gainers() if valid(r.get("Ticker") or "")]
+        losers = [r["Ticker"] for r in scan_losers() if valid(r.get("Ticker") or "")]
+        out: dict[str, Direction] = {t: Direction.LONG for t in gainers}
+        for t in losers:
+            if t not in out:
+                out[t] = Direction.SHORT
+        log.info(
+            "watchlist: %d gainers (LONG) + %d losers (SHORT) = %d tickers",
+            len(gainers), len(losers), len(out),
+        )
+        return out
 
     async def on_bar(self, bar) -> None:
         st = self.states.get(bar.symbol)
         if not st:
             return
-        internal = Bar(
+        ib = Bar(
             open=float(bar.open), high=float(bar.high),
             low=float(bar.low), close=float(bar.close),
             volume=float(bar.volume), timestamp=bar.timestamp,
         )
-        sig = st.on_bar(internal)
+        sig = st.on_bar(ib)
         log.debug(
-            "%s bar h=%.2f l=%.2f state=%s peak=%.2f pb_low=%.2f",
-            bar.symbol, bar.high, bar.low, st.state.value,
-            st.peak_high, st.pullback_low,
+            "%s dir=%s bar h=%.2f l=%.2f state=%s",
+            bar.symbol, st.direction.value, bar.high, bar.low, st.state.value,
         )
         if isinstance(sig, ArmSignal):
             await self._handle_arm(sig)
@@ -97,29 +117,51 @@ class BreakoutTrader:
             self.states[s.symbol].reset_to_watching()
             return
 
-        qty = position_size(self.equity, RISK_PCT, s.entry, s.stop, MIN_STOP_DIST)
+        qty = position_size(
+            self.equity, RISK_PCT, s.entry, s.stop,
+            MIN_STOP_DIST, MAX_DEPLOYMENT,
+        )
         if qty <= 0:
             log.warning("%s ARM skipped — qty 0", s.symbol)
             return
 
         log.info(
-            "%s ARM entry=%.2f stop=%.2f qty=%d risk=$%.2f",
-            s.symbol, s.entry, s.stop, qty, qty * max(s.entry - s.stop, MIN_STOP_DIST),
+            "%s ARM dir=%s entry=%.2f stop=%.2f qty=%d deploy=$%.2f",
+            s.symbol, s.direction.value, s.entry, s.stop, qty, qty * s.entry,
         )
+
         if self.dry_run:
             return
 
-        req = StopLimitOrderRequest(
-            symbol=s.symbol, qty=qty, side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            stop_price=round(s.entry, 2),
-            limit_price=round(s.entry + LIMIT_OFFSET, 2),
-        )
+        if s.direction is Direction.LONG:
+            req = StopLimitOrderRequest(
+                symbol=s.symbol, qty=qty, side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                stop_price=round(s.entry, 2),
+                limit_price=round(s.entry + LIMIT_OFFSET, 2),
+            )
+        else:
+            try:
+                asset = self.trading.get_asset(s.symbol)
+                if not getattr(asset, "shortable", False):
+                    log.info("%s not shortable — skipping", s.symbol)
+                    self.states[s.symbol].reset_to_watching()
+                    return
+            except Exception as e:
+                log.warning("%s asset lookup failed: %s", s.symbol, e)
+                return
+            req = StopLimitOrderRequest(
+                symbol=s.symbol, qty=qty, side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                stop_price=round(s.entry, 2),
+                limit_price=round(s.entry - LIMIT_OFFSET, 2),
+            )
+
         order = self.trading.submit_order(req)
         self.entry_orders[s.symbol] = str(order.id)
 
     async def _handle_reset(self, s: ResetSignal) -> None:
-        log.info("%s RESET (pullback low breached)", s.symbol)
+        log.info("%s RESET dir=%s (setup invalidated)", s.symbol, s.direction.value)
         oid = self.entry_orders.pop(s.symbol, None)
         if oid and not self.dry_run:
             try:
@@ -134,31 +176,45 @@ class BreakoutTrader:
         if not st:
             return
 
+        is_entry = str(order.id) == self.entry_orders.get(sym)
+
         if msg.event == "fill":
-            if str(order.side).lower().endswith("buy"):
+            if is_entry:
                 filled = int(float(order.filled_qty or 0))
                 price = float(order.filled_avg_price or 0)
-                log.info("%s ENTRY FILL qty=%d @ %.2f", sym, filled, price)
+                log.info(
+                    "%s ENTRY FILL dir=%s qty=%d @ %.2f",
+                    sym, st.direction.value, filled, price,
+                )
                 st.on_entry_filled()
                 self.entry_orders.pop(sym, None)
                 self.open_positions.add(sym)
-                trail = round(max(price - st.pullback_low, MIN_STOP_DIST), 2)
+
+                if st.direction is Direction.LONG:
+                    assert isinstance(st, BreakoutLongState)
+                    trail = round(max(price - st.pullback_low, MIN_STOP_DIST), 2)
+                    exit_side = OrderSide.SELL
+                else:
+                    assert isinstance(st, BreakoutShortState)
+                    trail = round(max(st.bounce_high - price, MIN_STOP_DIST), 2)
+                    exit_side = OrderSide.BUY
+
                 if self.dry_run:
-                    log.info("%s would trail $%.2f", sym, trail)
+                    log.info("%s (dry) trail $%.2f exit=%s", sym, trail, exit_side.value)
                     return
                 self.trading.submit_order(TrailingStopOrderRequest(
-                    symbol=sym, qty=filled, side=OrderSide.SELL,
+                    symbol=sym, qty=filled, side=exit_side,
                     time_in_force=TimeInForce.DAY, trail_price=trail,
                 ))
             else:
                 log.info(
-                    "%s EXIT FILL qty=%s @ %s",
-                    sym, order.filled_qty, order.filled_avg_price,
+                    "%s EXIT FILL dir=%s qty=%s @ %s",
+                    sym, st.direction.value, order.filled_qty, order.filled_avg_price,
                 )
                 st.on_exit_filled()
                 self.open_positions.discard(sym)
         elif msg.event in ("canceled", "expired", "rejected"):
-            if str(order.side).lower().endswith("buy"):
+            if is_entry:
                 self.entry_orders.pop(sym, None)
                 if st.state is State.ARMED:
                     st.reset_to_watching()
@@ -185,10 +241,13 @@ class BreakoutTrader:
         if not watchlist:
             log.warning("empty watchlist — exiting")
             return
-        for sym in watchlist:
-            self.states[sym] = BreakoutLongState(symbol=sym)
+        for sym, direction in watchlist.items():
+            if direction is Direction.LONG:
+                self.states[sym] = BreakoutLongState(symbol=sym)
+            else:
+                self.states[sym] = BreakoutShortState(symbol=sym)
 
-        self.data_stream.subscribe_bars(self.on_bar, *watchlist)
+        self.data_stream.subscribe_bars(self.on_bar, *watchlist.keys())
         self.trade_stream.subscribe_trade_updates(self.on_trade_update)
 
         now_et = datetime.now(EASTERN)
@@ -201,7 +260,7 @@ class BreakoutTrader:
         timer_task = asyncio.create_task(asyncio.sleep(wait_s))
 
         try:
-            done, pending = await asyncio.wait(
+            _, pending = await asyncio.wait(
                 [data_task, trade_task, timer_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
