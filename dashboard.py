@@ -255,11 +255,11 @@ with tab_trades:
         disp = df.copy()
         disp["entry"] = disp.apply(
             lambda r: f"{r['entry_at'].strftime('%m-%d %H:%M')} @ ${r['entry_price']:.2f}"
-            if r["entry_at"] else "", axis=1,
+            if pd.notna(r["entry_at"]) else "", axis=1,
         )
         disp["exit"] = disp.apply(
             lambda r: f"{r['exit_at'].strftime('%m-%d %H:%M')} @ ${r['exit_price']:.2f}"
-            if r["exit_at"] and r["exit_price"] else "—",
+            if pd.notna(r["exit_at"]) and pd.notna(r["exit_price"]) else "—",
             axis=1,
         )
         disp["duration"] = disp["duration_min"].apply(
