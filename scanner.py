@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from finvizfinance.screener.overview import Overview
 
 FILTERS = {
-    "Change": "Up 20%",
+    "Change": "Up 5%",
     "Current Volume": "Over 2M",
 }
 
