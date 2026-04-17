@@ -42,8 +42,8 @@ from strategy import (
 )
 
 EASTERN = ZoneInfo("America/New_York")
-MAX_CONCURRENT = 8
-MAX_DEPLOYMENT = 5000.0
+MAX_CONCURRENT = 16
+MAX_DEPLOYMENT = 2500.0
 MAX_RISK_PER_TRADE = 200.0
 CHOP_START = time(11, 30)
 CHOP_END = time(14, 0)
@@ -106,7 +106,7 @@ def _in_chop(ts_utc: datetime) -> bool:
     return CHOP_START <= t < CHOP_END
 
 
-def run_backtest():
+def run_backtest(print_report: bool = True) -> dict:
     load_dotenv()
     client = StockHistoricalDataClient(
         os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
@@ -117,7 +117,8 @@ def run_backtest():
     watchlist = load_watchlist()
     longs = [s for s, d in watchlist.items() if d is Direction.LONG]
     shorts = [s for s, d in watchlist.items() if d is Direction.SHORT]
-    print(f"backtesting: {len(longs)} LONG + {len(shorts)} SHORT = {len(watchlist)} tickers")
+    if print_report:
+        print(f"backtesting: {len(longs)} LONG + {len(shorts)} SHORT = {len(watchlist)} tickers")
 
     target = os.environ.get("BACKTEST_DATE")
     if target:
@@ -145,8 +146,9 @@ def run_backtest():
         for b in bars:
             events.append((b.timestamp, ticker, b))
     events.sort(key=lambda x: x[0])
-    print(f"loaded {len(events)} bar events")
-    print()
+    if print_report:
+        print(f"loaded {len(events)} bar events")
+        print()
 
     states: dict = {}
     for sym, d in watchlist.items():
@@ -330,39 +332,59 @@ def run_backtest():
         ))
 
     # Report
-    print(
-        f"{'Ticker':<7} {'Dir':<5} {'Entry':>7} {'TP':>7} {'Exit':>7} "
-        f"{'Qty':>6} {'P&L':>10}  {'Status':<15} Duration"
-    )
-    print("-" * 90)
-    for t in sorted(trades, key=lambda x: x.opened_at):
-        dur = t.closed_at - t.opened_at
-        tp_str = f"{t.tp_price:.2f}" if t.tp_price is not None else "-"
-        print(
-            f"{t.ticker:<7} {t.direction.value:<5} {t.entry_price:>7.2f} "
-            f"{tp_str:>7} {t.final_exit_price:>7.2f} {t.original_qty:>6} "
-            f"${t.pnl:>9.2f}  {t.status:<15} {dur}"
-        )
-
     closed_pnl = sum(t.pnl for t in trades if t.status != "open_eod")
     open_pnl = sum(t.pnl for t in trades if t.status == "open_eod")
-    by_dir = {}
+    by_dir: dict = {}
     for t in trades:
-        by_dir.setdefault(t.direction, 0.0)
-        by_dir[t.direction] += t.pnl
+        by_dir.setdefault(t.direction.value, 0.0)
+        by_dir[t.direction.value] += t.pnl
     n_closed = sum(1 for t in trades if t.status != "open_eod")
     n_with_tp = sum(1 for t in trades if t.status == "closed_with_tp")
     n_open = sum(1 for t in trades if t.status == "open_eod")
-    print()
-    print(f"Closed:         {n_closed}  (hit partial TP: {n_with_tp})  P&L ${closed_pnl:+,.2f}")
-    print(f"Open MTM:       {n_open}  P&L ${open_pnl:+,.2f}")
-    print(f"Skipped at cap: {skipped_at_cap}")
-    print(f"Skipped chop:   {skipped_chop}")
-    print(f"Circuit broken: {circuit_broken}")
-    for d, pnl in by_dir.items():
-        print(f"  {d.value:<5} P&L ${pnl:+,.2f}")
-    total = closed_pnl + open_pnl
-    print(f"Total:          ${total:+,.2f}  ({total/equity*100:+.3f}% of ${equity:,.0f})")
+
+    if print_report:
+        print(
+            f"{'Ticker':<7} {'Dir':<5} {'Entry':>7} {'TP':>7} {'Exit':>7} "
+            f"{'Qty':>6} {'P&L':>10}  {'Status':<15} Duration"
+        )
+        print("-" * 90)
+        for t in sorted(trades, key=lambda x: x.opened_at):
+            dur = t.closed_at - t.opened_at
+            tp_str = f"{t.tp_price:.2f}" if t.tp_price is not None else "-"
+            print(
+                f"{t.ticker:<7} {t.direction.value:<5} {t.entry_price:>7.2f} "
+                f"{tp_str:>7} {t.final_exit_price:>7.2f} {t.original_qty:>6} "
+                f"${t.pnl:>9.2f}  {t.status:<15} {dur}"
+            )
+        print()
+        print(f"Closed:         {n_closed}  (hit partial TP: {n_with_tp})  P&L ${closed_pnl:+,.2f}")
+        print(f"Open MTM:       {n_open}  P&L ${open_pnl:+,.2f}")
+        print(f"Skipped at cap: {skipped_at_cap}")
+        print(f"Skipped chop:   {skipped_chop}")
+        print(f"Circuit broken: {circuit_broken}")
+        for d, pnl in by_dir.items():
+            print(f"  {d:<5} P&L ${pnl:+,.2f}")
+        total = closed_pnl + open_pnl
+        print(f"Total:          ${total:+,.2f}  ({total/equity*100:+.3f}% of ${equity:,.0f})")
+
+    return {
+        "equity": equity,
+        "tickers": len(watchlist),
+        "longs": len(longs),
+        "shorts": len(shorts),
+        "events": len(events),
+        "n_closed": n_closed,
+        "n_open": n_open,
+        "n_tp": n_with_tp,
+        "closed_pnl": closed_pnl,
+        "open_pnl": open_pnl,
+        "total_pnl": closed_pnl + open_pnl,
+        "by_dir": by_dir,
+        "skipped_at_cap": skipped_at_cap,
+        "skipped_chop": skipped_chop,
+        "circuit_broken": circuit_broken,
+        "trades": trades,
+    }
 
 
 if __name__ == "__main__":
