@@ -119,16 +119,24 @@ def run_backtest():
     shorts = [s for s, d in watchlist.items() if d is Direction.SHORT]
     print(f"backtesting: {len(longs)} LONG + {len(shorts)} SHORT = {len(watchlist)} tickers")
 
-    now_et = datetime.now(EASTERN)
-    start_et = datetime.combine(now_et.date(), time(9, 30), tzinfo=EASTERN)
-    end_et = now_et
+    target = os.environ.get("BACKTEST_DATE")
+    if target:
+        from datetime import date as _date
+        d = _date.fromisoformat(target)
+        start_et = datetime.combine(d, time(9, 30), tzinfo=EASTERN)
+        end_et = datetime.combine(d, time(16, 0), tzinfo=EASTERN)
+    else:
+        now_et = datetime.now(EASTERN)
+        start_et = datetime.combine(now_et.date(), time(9, 30), tzinfo=EASTERN)
+        end_et = now_et
 
+    feed = DataFeed[os.environ.get("FEED", "IEX").upper()]
     req = StockBarsRequest(
         symbol_or_symbols=list(watchlist.keys()),
         timeframe=TimeFrame.Minute,
         start=start_et,
         end=end_et,
-        feed=DataFeed.IEX,
+        feed=feed,
     )
     resp = client.get_stock_bars(req)
 
