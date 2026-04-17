@@ -50,7 +50,6 @@ EOD_EXIT_ET = time(15, 55)
 CHOP_START = time(11, 30)
 CHOP_END = time(14, 0)
 
-RISK_PCT = 0.005
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
 MAX_RISK_PER_TRADE = 200.0
@@ -137,7 +136,7 @@ class BreakoutTrader:
             return
 
         qty = position_size(
-            self.equity, RISK_PCT, s.entry, s.stop,
+            s.entry, s.stop,
             max_deployment=MAX_DEPLOYMENT,
             max_risk=MAX_RISK_PER_TRADE,
         )

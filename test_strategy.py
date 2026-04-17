@@ -169,20 +169,19 @@ def test_position_size():
     assert min_stop_dist(0.46) == 0.01
     assert min_stop_dist(100.00) == 1.00
 
-    # $200 max risk per trade dominates for most normal-sized accounts.
+    # Flat $200 risk per trade.
     # $10 entry, $0.50 stop → qty = 200/0.50 = 400 shares ($4000 deploy).
-    assert position_size(100_000, 0.005, 10.00, 9.50) == 400
+    assert position_size(10.00, 9.50) == 400
     # Short: same qty since abs() in stop_dist.
-    assert position_size(100_000, 0.005, 9.50, 10.00) == 400
-    # Tiny actual stop → floor = 0.10, qty = 200/0.10 = 2000, but cap = 500.
-    assert position_size(100_000, 0.005, 10.00, 10.00) == 500
-    # Penny stock: entry $0.50, stop $0.49, floor = 0.01.
+    assert position_size(9.50, 10.00) == 400
+    # Tiny actual stop → floor 0.10 on $10 entry, qty_from_risk=2000, cap=500.
+    assert position_size(10.00, 10.00) == 500
+    # Penny: entry $0.50, stop $0.49, floor = 0.01.
     # qty_from_risk = 200/0.01 = 20000, qty_from_cap = 5000/0.50 = 10000.
-    assert position_size(100_000, 0.005, 0.50, 0.49) == 10_000
-    assert position_size(0, 0.005, 10.00, 9.50) == 0
-    # Max-risk override: $500 risk → 1000 shares at $0.50 stop, w/ headroom on deployment.
-    assert position_size(100_000, 0.005, 10.00, 9.50, max_risk=500, max_deployment=20_000) == 1000
-    print("✓ position sizing (proportional min stop, $200 risk cap)")
+    assert position_size(0.50, 0.49) == 10_000
+    # max_risk override
+    assert position_size(10.00, 9.50, max_risk=500, max_deployment=20_000) == 1000
+    print("✓ position sizing (flat $200 risk)")
 
 
 if __name__ == "__main__":

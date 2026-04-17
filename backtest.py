@@ -42,7 +42,6 @@ from strategy import (
 )
 
 EASTERN = ZoneInfo("America/New_York")
-RISK_PCT = 0.005
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
 MAX_RISK_PER_TRADE = 200.0
@@ -179,7 +178,7 @@ def run_backtest():
 
             if filled:
                 qty = position_size(
-                    equity, RISK_PCT, sig.entry, sig.stop,
+                    sig.entry, sig.stop,
                     max_deployment=MAX_DEPLOYMENT,
                     max_risk=MAX_RISK_PER_TRADE,
                 )
