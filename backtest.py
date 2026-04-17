@@ -220,6 +220,60 @@ def run_backtest(print_report: bool = True) -> dict:
             pos = positions[ticker]
             d = pos["direction"]
 
+            # Alternate exit mode: HARD_TP_PCT — exit full position at
+            # entry * (1 + pct/100) for long or (1 - pct/100) for short,
+            # no partial TP, no trail. Initial stop still applies.
+            # Hard take-profit at fixed % beats 1R-partial-+-trail on
+            # 22-day window (+9% P&L). Override via HARD_TP_PCT=0 for
+            # the legacy two-phase behavior.
+            hard_tp = float(os.environ.get("HARD_TP_PCT") or 7)
+            if hard_tp > 0 and pos.get("_hard_tp_target") is None:
+                if d is Direction.LONG:
+                    pos["_hard_tp_target"] = pos["entry"] * (1 + hard_tp / 100)
+                else:
+                    pos["_hard_tp_target"] = pos["entry"] * (1 - hard_tp / 100)
+                pos["_hard_tp_mode"] = True
+            if pos.get("_hard_tp_mode"):
+                hit_hard = (
+                    (d is Direction.LONG and b.high >= pos["_hard_tp_target"])
+                    or (d is Direction.SHORT and b.low <= pos["_hard_tp_target"])
+                )
+                hit_stop = (
+                    (d is Direction.LONG and b.low <= pos["initial_stop"])
+                    or (d is Direction.SHORT and b.high >= pos["initial_stop"])
+                )
+                exit_px = None
+                if hit_hard:
+                    exit_px = pos["_hard_tp_target"]
+                elif hit_stop:
+                    exit_px = pos["initial_stop"]
+                if exit_px is not None:
+                    pnl = (
+                        (exit_px - pos["entry"]) * pos["original_qty"]
+                        if d is Direction.LONG
+                        else (pos["entry"] - exit_px) * pos["original_qty"]
+                    )
+                    realized_pnl += pnl
+                    trades.append(Trade(
+                        ticker=ticker, direction=d,
+                        entry_price=pos["entry"],
+                        original_qty=pos["original_qty"],
+                        tp_price=exit_px if hit_hard else None,
+                        tp_qty=pos["original_qty"] if hit_hard else 0,
+                        final_exit_price=exit_px,
+                        final_exit_qty=pos["original_qty"],
+                        pnl=pnl,
+                        opened_at=pos["opened_at"], closed_at=ts,
+                        status="closed_with_tp" if hit_hard else "closed_no_tp",
+                        strategy=pos.get("strategy", ""),
+                    ))
+                    owner = pos.get("owner")
+                    if owner is not None:
+                        owner.on_exit_filled()
+                    del positions[ticker]
+                    # Skip the standard two-phase block below
+                    continue
+
             # Phase 1: check for TP level hit
             if pos["phase"] == 1:
                 hit_tp = (

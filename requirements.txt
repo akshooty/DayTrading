@@ -2,3 +2,6 @@ finvizfinance>=1.1.0
 alpaca-py>=0.33.0
 python-dotenv>=1.0.0
 pytz>=2024.1
+streamlit>=1.35
+plotly>=5.22
+pandas>=2.2
