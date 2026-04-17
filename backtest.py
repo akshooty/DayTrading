@@ -37,12 +37,12 @@ from strategy import (
     BreakoutShortState,
     Direction,
     ResetSignal,
+    min_stop_dist,
     position_size,
 )
 
 EASTERN = ZoneInfo("America/New_York")
 RISK_PCT = 0.005
-MIN_STOP_DIST = 0.10
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
 CHOP_START = time(11, 30)
@@ -71,10 +71,25 @@ def _valid(sym: str) -> bool:
 
 
 def load_watchlist() -> dict[str, Direction]:
+    longs = os.environ.get("LONG_WATCHLIST", "")
+    shorts = os.environ.get("SHORT_WATCHLIST", "")
+    if longs or shorts:
+        out: dict[str, Direction] = {}
+        for s in longs.split(","):
+            sym = s.strip().upper()
+            if _valid(sym):
+                out[sym] = Direction.LONG
+        for s in shorts.split(","):
+            sym = s.strip().upper()
+            if _valid(sym) and sym not in out:
+                out[sym] = Direction.SHORT
+        return out
+
     override = os.environ.get("WATCHLIST")
     if override:
         return {s.strip().upper(): Direction.LONG for s in override.split(",") if _valid(s.strip().upper())}
-    out: dict[str, Direction] = {}
+
+    out = {}
     for t in scan_gainers():
         sym = t.get("Ticker") or ""
         if _valid(sym):
@@ -156,10 +171,10 @@ def run_backtest():
             if filled:
                 qty = position_size(
                     equity, RISK_PCT, sig.entry, sig.stop,
-                    MIN_STOP_DIST, MAX_DEPLOYMENT,
+                    max_deployment=MAX_DEPLOYMENT,
                 )
                 if qty >= 2:  # need at least 2 to split 50/50
-                    initial_risk = max(abs(fill - sig.stop), MIN_STOP_DIST)
+                    initial_risk = max(abs(fill - sig.stop), min_stop_dist(fill))
                     if sig.direction is Direction.LONG:
                         tp_level = fill + initial_risk
                     else:

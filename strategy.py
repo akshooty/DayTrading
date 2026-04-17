@@ -243,14 +243,26 @@ class BreakoutShortState:
 BreakoutState = Union[BreakoutLongState, BreakoutShortState]
 
 
+def min_stop_dist(entry: float, floor: float = 0.01, pct: float = 0.01) -> float:
+    """Proportional minimum stop distance: max(1 cent, 1% of entry).
+
+    A flat $0.10 floor works for $10+ stocks but is absurdly wide for
+    sub-$1 stocks (22% of a $0.46 SAFX) and absurdly tight for $100+
+    stocks (0.1% of $100 MSTR). This scales with price.
+    """
+    return max(floor, pct * entry)
+
+
 def position_size(
     equity: float,
     risk_pct: float,
     entry: float,
     stop: float,
-    min_stop_distance: float = 0.10,
+    min_stop_distance: float | None = None,
     max_deployment: float = 5000.0,
 ) -> int:
+    if min_stop_distance is None:
+        min_stop_distance = min_stop_dist(entry)
     risk_dollars = equity * risk_pct
     stop_dist = max(abs(entry - stop), min_stop_distance)
     qty_from_risk = risk_dollars / stop_dist

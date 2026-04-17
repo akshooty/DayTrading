@@ -11,11 +11,13 @@ from finvizfinance.screener.overview import Overview
 GAINER_FILTERS = {
     "Change": "Up 5%",
     "Current Volume": "Over 2M",
+    "Price": "Over $1",
 }
 
 LOSER_FILTERS = {
     "Change": "Down 5%",
     "Current Volume": "Over 2M",
+    "Price": "Over $1",
 }
 
 

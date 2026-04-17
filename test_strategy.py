@@ -149,18 +149,22 @@ def test_short_aborts_on_new_low():
 
 
 def test_position_size():
+    from strategy import min_stop_dist
+    # Proportional min stop: max(1 cent, 1% of entry).
+    assert min_stop_dist(10.00) == 0.10
+    assert min_stop_dist(0.46) == 0.01
+    assert min_stop_dist(100.00) == 1.00
+
     # $5000 max deployment cap clamps large risk-based positions.
-    # risk 500 / stop 0.50 = 1000 shares, but 5000/$10 = 500 share cap wins.
     assert position_size(100_000, 0.005, 10.00, 9.50) == 500
-    assert position_size(100_000, 0.005, 9.50, 10.00) == 526  # short: 5000/9.50
-    # Tiny stop → risk formula would give 5000 shares; cap at 500.
+    assert position_size(100_000, 0.005, 9.50, 10.00) == 526
+    # Tiny stop → proportional min = $0.10 on $10 entry, risk formula = 5000 shares; cap at 500.
     assert position_size(100_000, 0.005, 10.00, 10.00) == 500
-    # $2 stock with $1 stop: risk 500 / 1 = 500 shares ($1000) beats 5000/$2=2500 cap.
-    assert position_size(100_000, 0.005, 2.00, 1.00) == 500
+    # Penny stock: min = 1 cent. tight stop now permits more shares but cap still wins.
+    assert position_size(100_000, 0.005, 0.50, 0.49) == 10_000  # cap 5000/0.50
     assert position_size(0, 0.005, 10.00, 9.50) == 0
-    # max_deployment override
     assert position_size(100_000, 0.005, 10.00, 9.50, max_deployment=10_000) == 1000
-    print("✓ position sizing (long + short, $5k cap)")
+    print("✓ position sizing (proportional min stop)")
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ from strategy import (
     Direction,
     ResetSignal,
     State,
+    min_stop_dist,
     position_size,
 )
 
@@ -50,7 +51,6 @@ CHOP_START = time(11, 30)
 CHOP_END = time(14, 0)
 
 RISK_PCT = 0.005
-MIN_STOP_DIST = 0.10
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
 LIMIT_OFFSET = 0.05
@@ -137,7 +137,7 @@ class BreakoutTrader:
 
         qty = position_size(
             self.equity, RISK_PCT, s.entry, s.stop,
-            MIN_STOP_DIST, MAX_DEPLOYMENT,
+            max_deployment=MAX_DEPLOYMENT,
         )
         if qty <= 0:
             log.warning("%s ARM skipped — qty 0", s.symbol)
@@ -209,13 +209,14 @@ class BreakoutTrader:
                 self.open_positions.add(sym)
                 self.entry_prices[sym] = price
 
+                msd = min_stop_dist(price)
                 if st.direction is Direction.LONG:
                     assert isinstance(st, BreakoutLongState)
-                    trail = round(max(price - st.pullback_low, MIN_STOP_DIST), 2)
+                    trail = round(max(price - st.pullback_low, msd), 2)
                     exit_side = OrderSide.SELL
                 else:
                     assert isinstance(st, BreakoutShortState)
-                    trail = round(max(st.bounce_high - price, MIN_STOP_DIST), 2)
+                    trail = round(max(st.bounce_high - price, msd), 2)
                     exit_side = OrderSide.BUY
 
                 if self.dry_run:
