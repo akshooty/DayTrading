@@ -46,12 +46,15 @@ from strategy import (
 
 EASTERN = ZoneInfo("America/New_York")
 EOD_EXIT_ET = time(15, 55)
+CHOP_START = time(11, 30)
+CHOP_END = time(14, 0)
 
 RISK_PCT = 0.005
 MIN_STOP_DIST = 0.10
 MAX_CONCURRENT = 8
 MAX_DEPLOYMENT = 5000.0
 LIMIT_OFFSET = 0.05
+DAILY_LOSS_LIMIT_PCT = 0.01
 
 log = logging.getLogger("trader")
 
@@ -68,7 +71,10 @@ class BreakoutTrader:
         self.states: dict[str, BreakoutState] = {}
         self.entry_orders: dict[str, str] = {}
         self.open_positions: set[str] = set()
+        self.entry_prices: dict[str, float] = {}
         self.equity: float = 0.0
+        self.realized_pnl: float = 0.0
+        self.circuit_broken: bool = False
 
     def load_watchlist(self) -> dict[str, Direction]:
         def valid(s: str) -> bool:
@@ -110,7 +116,19 @@ class BreakoutTrader:
         elif isinstance(sig, ResetSignal):
             await self._handle_reset(sig)
 
+    def _in_chop_now(self) -> bool:
+        t = datetime.now(EASTERN).time()
+        return CHOP_START <= t < CHOP_END
+
     async def _handle_arm(self, s: ArmSignal) -> None:
+        if self.circuit_broken:
+            log.info("%s ARM skipped (circuit breaker)", s.symbol)
+            self.states[s.symbol].reset_to_watching()
+            return
+        if self._in_chop_now():
+            log.info("%s ARM skipped (11:30-14:00 ET chop window)", s.symbol)
+            self.states[s.symbol].reset_to_watching()
+            return
         busy = len(self.entry_orders) + len(self.open_positions)
         if busy >= MAX_CONCURRENT:
             log.info("%s ARM skipped (at cap %d)", s.symbol, MAX_CONCURRENT)
@@ -189,6 +207,7 @@ class BreakoutTrader:
                 st.on_entry_filled()
                 self.entry_orders.pop(sym, None)
                 self.open_positions.add(sym)
+                self.entry_prices[sym] = price
 
                 if st.direction is Direction.LONG:
                     assert isinstance(st, BreakoutLongState)
@@ -207,9 +226,28 @@ class BreakoutTrader:
                     time_in_force=TimeInForce.DAY, trail_price=trail,
                 ))
             else:
+                exit_qty = int(float(order.filled_qty or 0))
+                exit_price = float(order.filled_avg_price or 0)
+                entry_price = self.entry_prices.pop(sym, 0.0)
+                if entry_price:
+                    trade_pnl = (
+                        (exit_price - entry_price) * exit_qty
+                        if st.direction is Direction.LONG
+                        else (entry_price - exit_price) * exit_qty
+                    )
+                    self.realized_pnl += trade_pnl
+                    if (
+                        self.realized_pnl <= -self.equity * DAILY_LOSS_LIMIT_PCT
+                        and not self.circuit_broken
+                    ):
+                        self.circuit_broken = True
+                        log.warning(
+                            "CIRCUIT BREAKER TRIPPED — realized P&L $%.2f <= -%.1f%% equity. No new entries.",
+                            self.realized_pnl, DAILY_LOSS_LIMIT_PCT * 100,
+                        )
                 log.info(
-                    "%s EXIT FILL dir=%s qty=%s @ %s",
-                    sym, st.direction.value, order.filled_qty, order.filled_avg_price,
+                    "%s EXIT FILL dir=%s qty=%d @ %.2f realized=$%.2f",
+                    sym, st.direction.value, exit_qty, exit_price, self.realized_pnl,
                 )
                 st.on_exit_filled()
                 self.open_positions.discard(sym)

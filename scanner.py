@@ -11,12 +11,16 @@ from finvizfinance.screener.overview import Overview
 GAINER_FILTERS = {
     "Change": "Up 5%",
     "Current Volume": "Over 2M",
+    "Price": "Over $5",
 }
 
 LOSER_FILTERS = {
     "Change": "Down 5%",
     "Current Volume": "Over 2M",
+    "Price": "Over $5",
 }
+
+EXCLUDED_INDUSTRIES = {"Exchange Traded Fund"}
 
 
 def _scan(filters: dict) -> list[dict]:
@@ -25,7 +29,8 @@ def _scan(filters: dict) -> list[dict]:
     df = screener.screener_view()
     if df is None or df.empty:
         return []
-    return df.to_dict(orient="records")
+    records = df.to_dict(orient="records")
+    return [r for r in records if r.get("Industry") not in EXCLUDED_INDUSTRIES]
 
 
 def scan_gainers() -> list[dict]:
