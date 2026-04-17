@@ -30,11 +30,19 @@ def test_long_happy_path():
     assert st.state is State.UPTREND
     assert st.peak_high == 108
 
+    # First LH bar begins pullback
     st.on_bar(mk(107.5, 105.5, 9))
     assert st.state is State.PULLBACK
     assert st.lh_count == 1
 
+    # Second LH bar — pullback threshold met, but we need a reversal bar to ARM
     sig = st.on_bar(mk(107, 105, 10))
+    assert sig is None
+    assert st.state is State.PULLBACK
+    assert st.lh_count == 2
+
+    # Reversal bar (first HH after pullback) → ARM
+    sig = st.on_bar(mk(107.5, 106, 11))
     assert isinstance(sig, ArmSignal)
     assert sig.direction is Direction.LONG
     assert sig.entry == 108 and sig.stop == 105
@@ -44,7 +52,7 @@ def test_long_happy_path():
     assert st.state is State.IN_POSITION
     st.on_exit_filled()
     assert st.state is State.CLOSED
-    print("✓ long happy path")
+    print("✓ long happy path (reversal + break-HOD)")
 
 
 def test_long_reset_on_breach():
@@ -54,9 +62,10 @@ def test_long_reset_on_breach():
     for i, (h, l) in enumerate([(105, 103), (106, 104), (107, 105), (108, 106)], start=5):
         st.on_bar(mk(h, l, i))
     st.on_bar(mk(107.5, 105.5, 9))
-    assert isinstance(st.on_bar(mk(107, 105, 10)), ArmSignal)
+    st.on_bar(mk(107, 105, 10))  # lh_count=2, still PULLBACK
+    assert isinstance(st.on_bar(mk(107.5, 106, 11)), ArmSignal)  # reversal → ARM
 
-    reset = st.on_bar(mk(106, 104.5, 11))
+    reset = st.on_bar(mk(106, 104.5, 12))
     assert isinstance(reset, ResetSignal)
     assert reset.direction is Direction.LONG
     assert st.state is State.WATCHING
@@ -92,25 +101,29 @@ def test_short_happy_path():
     assert st.state is State.DOWNTREND
     assert st.trough_low == 91
 
-    # First HL starts the bounce
+    # First HL bar starts bounce
     st.on_bar(mk(94, 92, 9))
     assert st.state is State.BOUNCE
-    assert st.bounce_high == 94
     assert st.hl_count == 1
 
-    # Second HL confirms bounce → ARM
+    # Second HL — bounce confirmed but needs reversal to ARM
     sig = st.on_bar(mk(95, 93, 10))
+    assert sig is None
+    assert st.state is State.BOUNCE
+    assert st.hl_count == 2
+
+    # Reversal bar (first LL after bounce) → ARM
+    sig = st.on_bar(mk(94.5, 92.5, 11))
     assert isinstance(sig, ArmSignal)
     assert sig.direction is Direction.SHORT
-    assert sig.entry == 91  # breakdown level = pre-bounce trough
-    assert sig.stop == 95   # reversal high during bounce
-    assert st.state is State.ARMED
+    assert sig.entry == 91
+    assert sig.stop == 95
 
     st.on_entry_filled()
     assert st.state is State.IN_POSITION
     st.on_exit_filled()
     assert st.state is State.CLOSED
-    print("✓ short happy path")
+    print("✓ short happy path (reversal + break-LOD)")
 
 
 def test_short_reset_on_breach():
@@ -120,11 +133,12 @@ def test_short_reset_on_breach():
     for i, (h, l) in enumerate([(96, 94), (95, 93), (94, 92), (93, 91)], start=5):
         st.on_bar(mk(h, l, i))
     st.on_bar(mk(94, 92, 9))
-    sig = st.on_bar(mk(95, 93, 10))
+    st.on_bar(mk(95, 93, 10))  # hl_count=2
+    sig = st.on_bar(mk(94.5, 92.5, 11))  # reversal → ARM
     assert isinstance(sig, ArmSignal)
 
     # Bar breaches bounce_high (95) → reset
-    reset = st.on_bar(mk(95.5, 93.5, 11))
+    reset = st.on_bar(mk(95.5, 93.5, 12))
     assert isinstance(reset, ResetSignal)
     assert reset.direction is Direction.SHORT
     assert st.state is State.WATCHING

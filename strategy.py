@@ -107,6 +107,10 @@ class BreakoutLongState:
         return None
 
     def _on_pullback(self, bar: Bar) -> Optional[Signal]:
+        """Pullback: count LH bars, then wait for a reversal (first HH
+        bar after the pullback) before arming. ARM fires on the
+        reversal bar; the actual entry order waits for price to break
+        back above the pre-pullback peak (HOD)."""
         if bar.low < self.pullback_low:
             self.pullback_low = bar.low
         prev = self.bars[-2]
@@ -117,9 +121,10 @@ class BreakoutLongState:
             return None
         if bar.high < prev.high:
             self.lh_count += 1
-            if self.lh_count >= self.lh_transitions:
-                self.state = State.ARMED
-                return ArmSignal(self.symbol, Direction.LONG, self.peak_high, self.pullback_low)
+            return None
+        if bar.high > prev.high and self.lh_count >= self.lh_transitions:
+            self.state = State.ARMED
+            return ArmSignal(self.symbol, Direction.LONG, self.peak_high, self.pullback_low)
         return None
 
     def _on_armed(self, bar: Bar) -> Optional[Signal]:
@@ -199,6 +204,10 @@ class BreakoutShortState:
         return None
 
     def _on_bounce(self, bar: Bar) -> Optional[Signal]:
+        """Bounce: count HL bars, then wait for reversal (first LL bar
+        after the bounce) before arming. ARM fires on the reversal
+        bar; entry order waits for price to break below pre-bounce
+        trough (LOD)."""
         if bar.high > self.bounce_high:
             self.bounce_high = bar.high
         prev = self.bars[-2]
@@ -209,9 +218,10 @@ class BreakoutShortState:
             return None
         if bar.low > prev.low:
             self.hl_count += 1
-            if self.hl_count >= self.hl_transitions:
-                self.state = State.ARMED
-                return ArmSignal(self.symbol, Direction.SHORT, self.trough_low, self.bounce_high)
+            return None
+        if bar.low < prev.low and self.hl_count >= self.hl_transitions:
+            self.state = State.ARMED
+            return ArmSignal(self.symbol, Direction.SHORT, self.trough_low, self.bounce_high)
         return None
 
     def _on_armed(self, bar: Bar) -> Optional[Signal]:
