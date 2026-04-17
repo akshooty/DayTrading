@@ -72,12 +72,13 @@ def fetch_positions():
 
 @st.cache_data(ttl=30)
 def fetch_trades(days: int = 30):
-    """Pair filled orders into round-trip trades (entry + exit) and
-    compute per-trade P&L, duration, and cumulative stats.
+    """Reconstruct round-trip trades from filled orders.
 
-    Assumes at most one open position per symbol at any time (which is
-    the bot's design invariant). For positions still open, the trade is
-    returned with exit fields blank.
+    Tracks signed net quantity per symbol and weighted-average entry
+    price. A trade is emitted when net qty returns to 0 (or flips to
+    the opposite direction — the flip portion becomes a new entry).
+    Scale-ins fold into the weighted-avg entry; scale-outs aggregate
+    into a VWAP exit.
     """
     c = alpaca_client()
     after = datetime.now(EASTERN) - timedelta(days=days)
@@ -93,8 +94,39 @@ def fetch_trades(days: int = 30):
     ]
     filled.sort(key=lambda o: o.filled_at)
 
-    trades = []
-    open_pos: dict[str, dict] = {}
+    trades: list[dict] = []
+    pos: dict[str, dict] = {}
+
+    def open_new(sym: str, qty: float, price: float, t, signed: float):
+        pos[sym] = {
+            "net": signed,
+            "entry_at": t,
+            "direction": "long" if signed > 0 else "short",
+            "entry_total": abs(signed) * price,
+            "entry_qty": abs(signed),
+            "exit_total": 0.0,
+            "exit_qty": 0.0,
+        }
+
+    def close_trade(sym: str, t):
+        p = pos[sym]
+        avg_entry = p["entry_total"] / p["entry_qty"] if p["entry_qty"] else 0
+        avg_exit = p["exit_total"] / p["exit_qty"] if p["exit_qty"] else 0
+        pnl = (
+            (avg_exit - avg_entry) * p["entry_qty"]
+            if p["direction"] == "long"
+            else (avg_entry - avg_exit) * p["entry_qty"]
+        )
+        trades.append({
+            "entry_at": p["entry_at"], "exit_at": t,
+            "symbol": sym, "direction": p["direction"],
+            "qty": p["entry_qty"],
+            "entry_price": avg_entry,
+            "exit_price": avg_exit,
+            "pnl": pnl,
+            "duration_min": (t - p["entry_at"]).total_seconds() / 60,
+            "status": "closed",
+        })
 
     for o in filled:
         sym = o.symbol
@@ -102,40 +134,48 @@ def fetch_trades(days: int = 30):
         qty = float(o.filled_qty or 0)
         price = float(o.filled_avg_price or 0)
         t = o.filled_at.astimezone(EASTERN)
+        signed = qty if "buy" in side else -qty
+        if qty == 0 or price == 0:
+            continue
 
-        if sym not in open_pos:
-            direction = "long" if side.endswith("buy") else "short"
-            open_pos[sym] = {
-                "entry_at": t, "entry_price": price, "qty": qty,
-                "direction": direction,
-            }
+        if sym not in pos:
+            open_new(sym, qty, price, t, signed)
+            continue
+
+        p = pos[sym]
+        same_direction = (p["net"] > 0 and signed > 0) or (p["net"] < 0 and signed < 0)
+
+        if same_direction:
+            # Scaling in — update weighted avg entry
+            p["entry_total"] += qty * price
+            p["entry_qty"] += qty
+            p["net"] += signed
         else:
-            ent = open_pos.pop(sym)
-            if ent["direction"] == "long":
-                pnl = (price - ent["entry_price"]) * min(qty, ent["qty"])
-            else:
-                pnl = (ent["entry_price"] - price) * min(qty, ent["qty"])
-            trades.append({
-                "entry_at": ent["entry_at"],
-                "exit_at": t,
-                "symbol": sym,
-                "direction": ent["direction"],
-                "qty": ent["qty"],
-                "entry_price": ent["entry_price"],
-                "exit_price": price,
-                "pnl": pnl,
-                "duration_min": (t - ent["entry_at"]).total_seconds() / 60,
-                "status": "closed",
-            })
+            # Reducing, closing, or flipping direction
+            close_qty = min(qty, abs(p["net"]))
+            p["exit_total"] += close_qty * price
+            p["exit_qty"] += close_qty
+            new_net = p["net"] + signed
 
-    for sym, ent in open_pos.items():
+            flipped = (p["net"] > 0 and new_net < 0) or (p["net"] < 0 and new_net > 0)
+            flat = abs(new_net) < 1e-9
+
+            if flat or flipped:
+                close_trade(sym, t)
+                if flipped:
+                    remainder = abs(new_net)
+                    open_new(sym, remainder, price, t, new_net)
+                else:
+                    del pos[sym]
+            else:
+                p["net"] = new_net
+
+    for sym, p in pos.items():
         trades.append({
-            "entry_at": ent["entry_at"],
-            "exit_at": None,
-            "symbol": sym,
-            "direction": ent["direction"],
-            "qty": ent["qty"],
-            "entry_price": ent["entry_price"],
+            "entry_at": p["entry_at"], "exit_at": None,
+            "symbol": sym, "direction": p["direction"],
+            "qty": p["entry_qty"],
+            "entry_price": p["entry_total"] / p["entry_qty"] if p["entry_qty"] else 0,
             "exit_price": None,
             "pnl": None,
             "duration_min": None,
