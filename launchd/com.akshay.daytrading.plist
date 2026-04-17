@@ -18,6 +18,8 @@
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>DRY_RUN</key>
+        <string>1</string>
     </dict>
 
     <key>StartCalendarInterval</key>
