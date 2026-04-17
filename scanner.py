@@ -36,7 +36,6 @@ LOSER_FILTERS = {
     "Float": "Under 100M",
 }
 
-MIN_SHORT_RATIO = 4.0
 MAX_FLOAT_TO_VOLUME = 20.0
 
 
@@ -65,20 +64,29 @@ def _parse_number(x) -> float | None:
 
 
 def _post_filter(records: list[dict]) -> list[dict]:
-    keep = []
+    """Apply the float/volume gate, then sort by short ratio (desc).
+
+    Short ratio is treated as a RANKING signal, not a hard filter — the
+    trader subscribes in this order so when multiple ARM signals compete
+    for the concurrent-position cap, higher-squeeze-fuel names win ties.
+    """
+    kept = []
     for r in records:
         float_shs = _parse_number(r.get("Float"))
-        short_ratio = _parse_number(r.get("Short Ratio"))
         volume = _parse_number(r.get("Volume"))
-
         if float_shs is None or volume is None or volume == 0:
-            continue
-        if short_ratio is None or short_ratio < MIN_SHORT_RATIO:
             continue
         if float_shs / volume >= MAX_FLOAT_TO_VOLUME:
             continue
-        keep.append(r)
-    return keep
+        kept.append(r)
+
+    def sort_key(r):
+        sr = _parse_number(r.get("Short Ratio"))
+        # Missing SR → sort last. Otherwise higher SR first.
+        return (sr is None, -(sr or 0.0))
+
+    kept.sort(key=sort_key)
+    return kept
 
 
 def _scan(filters: dict) -> list[dict]:
@@ -116,19 +124,15 @@ def main() -> int:
         "scanned_at": datetime.now(timezone.utc).isoformat(),
         "gainers": {
             "filters": GAINER_FILTERS,
-            "post_filters": {
-                "min_short_ratio": MIN_SHORT_RATIO,
-                "max_float_to_volume": MAX_FLOAT_TO_VOLUME,
-            },
+            "post_filters": {"max_float_to_volume": MAX_FLOAT_TO_VOLUME},
+            "ranked_by": "short_ratio_desc",
             "count": len(gainers),
             "tickers": gainers,
         },
         "losers": {
             "filters": LOSER_FILTERS,
-            "post_filters": {
-                "min_short_ratio": MIN_SHORT_RATIO,
-                "max_float_to_volume": MAX_FLOAT_TO_VOLUME,
-            },
+            "post_filters": {"max_float_to_volume": MAX_FLOAT_TO_VOLUME},
+            "ranked_by": "short_ratio_desc",
             "count": len(losers),
             "tickers": losers,
         },
