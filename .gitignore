@@ -7,3 +7,5 @@ venv/
 .DS_Store
 scan_results/
 *.log
+logs/*
+!logs/.gitkeep
