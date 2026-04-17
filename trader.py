@@ -39,7 +39,7 @@ EOD_EXIT_ET = time(15, 55)
 
 RISK_PCT = 0.005
 MIN_STOP_DIST = 0.10
-MAX_CONCURRENT = 3
+MAX_CONCURRENT = 5
 LIMIT_OFFSET = 0.05
 
 log = logging.getLogger("trader")
