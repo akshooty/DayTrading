@@ -36,6 +36,7 @@ from strategy import (
     BreakoutLongState,
     BreakoutShortState,
     Direction,
+    ORBState,
     ResetSignal,
     min_stop_dist,
     position_size,
@@ -64,6 +65,7 @@ class Trade:
     opened_at: datetime
     closed_at: datetime
     status: str  # 'closed_with_tp' | 'closed_no_tp' | 'open_eod'
+    strategy: str = ""
 
 
 def _valid(sym: str) -> bool:
@@ -150,12 +152,16 @@ def run_backtest(print_report: bool = True) -> dict:
         print(f"loaded {len(events)} bar events")
         print()
 
-    states: dict = {}
+    # Each ticker runs TWO state machines in parallel: the directional
+    # breakout (uptrend/pullback/reversal) and ORB (first-10-min range).
+    # First one to ARM wins the ticker's position slot.
+    states: dict[str, list] = {}
     for sym, d in watchlist.items():
-        states[sym] = BreakoutLongState(sym) if d is Direction.LONG else BreakoutShortState(sym)
+        primary = BreakoutLongState(sym) if d is Direction.LONG else BreakoutShortState(sym)
+        states[sym] = [primary, ORBState(sym)]
 
     positions: dict[str, dict] = {}
-    pending: dict[str, ArmSignal] = {}
+    pending: dict[str, tuple[ArmSignal, object]] = {}
     trades: list[Trade] = []
     skipped_at_cap = 0
     skipped_chop = 0
@@ -163,13 +169,13 @@ def run_backtest(print_report: bool = True) -> dict:
     realized_pnl = 0.0
 
     for ts, ticker, b in events:
-        st = states.get(ticker)
-        if st is None:
+        sts = states.get(ticker)
+        if not sts:
             continue
 
         # Check pending fill
         if ticker in pending:
-            sig = pending[ticker]
+            sig, armed_state = pending[ticker]
             filled = False
             if sig.direction is Direction.LONG and b.high >= sig.entry:
                 fill = max(sig.entry, b.open)
@@ -203,8 +209,10 @@ def run_backtest(print_report: bool = True) -> dict:
                         stop=sig.stop,
                         tp_price=None,
                         opened_at=ts,
+                        owner=armed_state,
+                        strategy=type(armed_state).__name__,
                     )
-                    st.on_entry_filled()
+                    armed_state.on_entry_filled()
                 del pending[ticker]
 
         # Manage open position
@@ -274,35 +282,44 @@ def run_backtest(print_report: bool = True) -> dict:
                     pnl=tp_pnl + final_pnl,
                     opened_at=pos["opened_at"], closed_at=ts,
                     status=status,
+                    strategy=pos.get("strategy", ""),
                 ))
+                owner = pos.get("owner")
+                if owner is not None:
+                    owner.on_exit_filled()
                 del positions[ticker]
-                st.on_exit_filled()
 
         # Circuit breaker — stop taking new entries
         if realized_pnl <= daily_loss_cap and not circuit_broken:
             circuit_broken = True
 
-        # Drive state machine
+        # Drive ALL state machines for this ticker
         ib = IntBar(
             open=b.open, high=b.high, low=b.low, close=b.close,
             volume=b.volume, timestamp=ts,
         )
-        sig = st.on_bar(ib)
-        if isinstance(sig, ArmSignal):
-            if circuit_broken:
-                st.reset_to_watching()
-                continue
-            if _in_chop(ts):
-                skipped_chop += 1
-                st.reset_to_watching()
-                continue
-            if len(positions) + len(pending) >= MAX_CONCURRENT:
-                skipped_at_cap += 1
-                st.reset_to_watching()
-                continue
-            pending[ticker] = sig
-        elif isinstance(sig, ResetSignal):
-            pending.pop(ticker, None)
+        for st in sts:
+            sig = st.on_bar(ib)
+            if isinstance(sig, ArmSignal):
+                if circuit_broken:
+                    st.reset_to_watching()
+                    continue
+                if _in_chop(ts):
+                    skipped_chop += 1
+                    st.reset_to_watching()
+                    continue
+                if ticker in positions or ticker in pending:
+                    # Another state machine already owns this ticker
+                    st.reset_to_watching()
+                    continue
+                if len(positions) + len(pending) >= MAX_CONCURRENT:
+                    skipped_at_cap += 1
+                    st.reset_to_watching()
+                    continue
+                pending[ticker] = (sig, st)
+            elif isinstance(sig, ResetSignal):
+                if ticker in pending and pending[ticker][1] is st:
+                    del pending[ticker]
 
     # Mark-to-market still-open
     last_close: dict[str, float] = {}
@@ -329,6 +346,7 @@ def run_backtest(print_report: bool = True) -> dict:
             pnl=tp_pnl + final_pnl,
             opened_at=pos["opened_at"], closed_at=end_et,
             status="open_eod",
+            strategy=pos.get("strategy", ""),
         ))
 
     # Report

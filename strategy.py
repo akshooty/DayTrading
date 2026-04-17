@@ -250,7 +250,67 @@ class BreakoutShortState:
         self.state = State.CLOSED
 
 
-BreakoutState = Union[BreakoutLongState, BreakoutShortState]
+@dataclass
+class ORBState:
+    """Opening Range Breakout.
+
+    Track high/low of the first `range_bars` minutes of the session.
+    Once range is defined, ARM on first bar whose high > range_high
+    (LONG) or low < range_low (SHORT). Stop = opposite side of range.
+    """
+    symbol: str
+    range_bars: int = 10  # first N 1-min bars form the range
+
+    state: State = State.WATCHING
+    bars: list[Bar] = field(default_factory=list)
+    range_high: float = 0.0
+    range_low: float = float("inf")
+    range_defined: bool = False
+
+    # direction is set when the range breaks; trader uses it post-fill.
+    direction: Direction = Direction.LONG
+
+    def on_bar(self, bar: Bar) -> Optional[Signal]:
+        self.bars.append(bar)
+
+        if not self.range_defined:
+            if bar.high > self.range_high:
+                self.range_high = bar.high
+            if bar.low < self.range_low:
+                self.range_low = bar.low
+            if len(self.bars) >= self.range_bars:
+                self.range_defined = True
+            return None
+
+        if self.state is not State.WATCHING:
+            return None
+
+        # Range defined; watch for breakout. Long takes precedence if a
+        # single bar straddles both boundaries (rare).
+        if bar.high > self.range_high:
+            self.state = State.ARMED
+            self.direction = Direction.LONG
+            return ArmSignal(self.symbol, Direction.LONG, self.range_high, self.range_low)
+        if bar.low < self.range_low:
+            self.state = State.ARMED
+            self.direction = Direction.SHORT
+            return ArmSignal(self.symbol, Direction.SHORT, self.range_low, self.range_high)
+        return None
+
+    def reset_to_watching(self) -> None:
+        # ORB is one-shot per day: once the range breaks and we miss
+        # the entry (cap full, ticker busy, chop window), the setup is
+        # gone. Terminate to prevent re-arming every subsequent bar.
+        self.state = State.CLOSED
+
+    def on_entry_filled(self) -> None:
+        self.state = State.IN_POSITION
+
+    def on_exit_filled(self) -> None:
+        self.state = State.CLOSED
+
+
+BreakoutState = Union[BreakoutLongState, BreakoutShortState, ORBState]
 
 
 def min_stop_dist(entry: float, floor: float = 0.01, pct: float = 0.01) -> float:
