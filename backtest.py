@@ -46,8 +46,17 @@ EASTERN = ZoneInfo("America/New_York")
 MAX_CONCURRENT = 16
 MAX_DEPLOYMENT = 2500.0
 MAX_RISK_PER_TRADE = 200.0
-CHOP_START = time(11, 30)
-CHOP_END = time(14, 0)
+def _parse_et(env_key: str, default: time) -> time:
+    raw = os.environ.get(env_key)
+    if not raw:
+        return default
+    h, m = raw.split(":")
+    return time(int(h), int(m))
+
+CHOP_START = _parse_et("CHOP_START_ET", time(11, 30))
+CHOP_END = _parse_et("CHOP_END_ET", time(14, 0))
+_eod_raw = os.environ.get("EOD_CUTOFF_ET")
+EOD_CUTOFF: time | None = _parse_et("EOD_CUTOFF_ET", time(15, 55)) if _eod_raw else None
 DAILY_LOSS_LIMIT_PCT = 0.01
 
 
@@ -70,6 +79,18 @@ class Trade:
 
 def _valid(sym: str) -> bool:
     return bool(sym) and sym.isalnum()
+
+
+def _compute_atr(bars: list, period: int = 14) -> float:
+    if len(bars) < period + 1:
+        return 0.0
+    trs = []
+    recent = bars[-(period + 1):]
+    for i in range(1, len(recent)):
+        b, prev = recent[i], recent[i - 1]
+        tr = max(b.high - b.low, abs(b.high - prev.close), abs(b.low - prev.close))
+        trs.append(tr)
+    return sum(trs) / period
 
 
 def load_watchlist() -> dict[str, Direction]:
@@ -108,7 +129,7 @@ def _in_chop(ts_utc: datetime) -> bool:
     return CHOP_START <= t < CHOP_END
 
 
-def run_backtest(print_report: bool = True) -> dict:
+def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
     load_dotenv()
     client = StockHistoricalDataClient(
         os.environ["ALPACA_API_KEY"].strip(), os.environ["ALPACA_SECRET_KEY"].strip()
@@ -162,15 +183,69 @@ def run_backtest(print_report: bool = True) -> dict:
 
     positions: dict[str, dict] = {}
     pending: dict[str, tuple[ArmSignal, object]] = {}
+    ma9_5m: dict[str, dict] = {}  # per-ticker 5m EMA(9) state
     trades: list[Trade] = []
+    locked_out: set[str] = set()  # tickers stopped out >$LOCKOUT_LOSS today; no re-entry
+    lockout_loss = float(os.environ.get("LOCKOUT_LOSS", 150))
     skipped_at_cap = 0
     skipped_chop = 0
+    skipped_locked = 0
     circuit_broken = False
     realized_pnl = 0.0
 
     for ts, ticker, b in events:
         sts = states.get(ticker)
         if not sts:
+            continue
+
+        # Update 5-min EMA(9) buffer per ticker (used by Phase 2 MA9 exit).
+        ma_state = ma9_5m.setdefault(ticker, {"buf": [], "closes": [], "ema": None})
+        ma_state["buf"].append(b)
+        if ts.astimezone(EASTERN).minute % 5 == 4:
+            close_5m = ma_state["buf"][-1].close
+            ma_state["buf"] = []
+            if ma_state["ema"] is None:
+                ma_state["closes"].append(close_5m)
+                if len(ma_state["closes"]) >= 9:
+                    ma_state["ema"] = sum(ma_state["closes"][-9:]) / 9.0
+            else:
+                k = 2.0 / (9 + 1)
+                ma_state["ema"] = close_5m * k + ma_state["ema"] * (1 - k)
+
+        # EOD force-close: at first bar past cutoff, close any open
+        # position at bar.open and skip the rest of management/entries.
+        if EOD_CUTOFF is not None and ts.astimezone(EASTERN).time() >= EOD_CUTOFF:
+            if ticker in positions:
+                pos = positions[ticker]
+                d = pos["direction"]
+                exit_px = b.open
+                final_qty = pos["remaining_qty"]
+                final_pnl = (
+                    (exit_px - pos["entry"]) * final_qty
+                    if d is Direction.LONG
+                    else (pos["entry"] - exit_px) * final_qty
+                )
+                tp_pnl = pos.get("_tp_pnl", 0.0)
+                tp_qty = pos.get("_tp_qty", 0)
+                realized_pnl += final_pnl
+                trades.append(Trade(
+                    ticker=ticker, direction=d,
+                    entry_price=pos["entry"],
+                    original_qty=pos["original_qty"],
+                    tp_price=pos["tp_price"], tp_qty=tp_qty,
+                    final_exit_price=exit_px,
+                    final_exit_qty=final_qty,
+                    pnl=tp_pnl + final_pnl,
+                    opened_at=pos["opened_at"], closed_at=ts,
+                    status="closed_no_tp",
+                    strategy=pos.get("strategy", ""),
+                ))
+                owner = pos.get("owner")
+                if owner is not None:
+                    owner.on_exit_filled()
+                del positions[ticker]
+            if ticker in pending:
+                del pending[ticker]
             continue
 
         # Check pending fill
@@ -192,10 +267,21 @@ def run_backtest(print_report: bool = True) -> dict:
                 )
                 if qty >= 2:  # need at least 2 to split 50/50
                     initial_risk = max(abs(fill - sig.stop), min_stop_dist(fill))
-                    if sig.direction is Direction.LONG:
-                        tp_level = fill + initial_risk
+                    hybrid_mode = os.environ.get("HYBRID_TP", "1").lower() in ("1", "true", "yes")
+                    hybrid_tp_pct = float(os.environ.get("HYBRID_TP_PCT", 4))
+                    hybrid_atr_period = int(os.environ.get("HYBRID_ATR_PERIOD", 14))
+                    if hybrid_mode:
+                        if sig.direction is Direction.LONG:
+                            tp_level = fill * (1 + hybrid_tp_pct / 100)
+                        else:
+                            tp_level = fill * (1 - hybrid_tp_pct / 100)
+                        atr_at_entry = _compute_atr(armed_state.bars, hybrid_atr_period)
                     else:
-                        tp_level = fill - initial_risk
+                        if sig.direction is Direction.LONG:
+                            tp_level = fill + initial_risk
+                        else:
+                            tp_level = fill - initial_risk
+                        atr_at_entry = 0.0
                     positions[ticker] = dict(
                         direction=sig.direction,
                         entry=fill,
@@ -211,6 +297,8 @@ def run_backtest(print_report: bool = True) -> dict:
                         opened_at=ts,
                         owner=armed_state,
                         strategy=type(armed_state).__name__,
+                        _atr_at_entry=atr_at_entry,
+                        _hybrid_mode=hybrid_mode,
                     )
                     armed_state.on_entry_filled()
                 del pending[ticker]
@@ -226,7 +314,7 @@ def run_backtest(print_report: bool = True) -> dict:
             # Hard take-profit at fixed % beats 1R-partial-+-trail on
             # 22-day window (+9% P&L). Override via HARD_TP_PCT=0 for
             # the legacy two-phase behavior.
-            hard_tp = float(os.environ.get("HARD_TP_PCT") or 7)
+            hard_tp = 0.0 if pos.get("_hybrid_mode") else float(os.environ.get("HARD_TP_PCT") or 7)
             if hard_tp > 0 and pos.get("_hard_tp_target") is None:
                 if d is Direction.LONG:
                     pos["_hard_tp_target"] = pos["entry"] * (1 + hard_tp / 100)
@@ -270,6 +358,8 @@ def run_backtest(print_report: bool = True) -> dict:
                     owner = pos.get("owner")
                     if owner is not None:
                         owner.on_exit_filled()
+                    if pnl < -lockout_loss:
+                        locked_out.add(ticker)
                     del positions[ticker]
                     # Skip the standard two-phase block below
                     continue
@@ -298,14 +388,31 @@ def run_backtest(print_report: bool = True) -> dict:
 
             # Phase 2: trailing stop for remaining 50%
             if pos["phase"] == 2:
-                if d is Direction.LONG:
-                    if b.high > pos["extreme"]:
-                        pos["extreme"] = b.high
-                        pos["stop"] = max(pos["stop"], pos["extreme"] - pos["initial_risk"])
+                use_ma9 = (
+                    pos.get("_hybrid_mode")
+                    and os.environ.get("EXIT_MA9_5M", "").lower() in ("1", "true", "yes")
+                )
+                if use_ma9:
+                    ema9 = ma9_5m.get(ticker, {}).get("ema")
+                    if ema9 is not None:
+                        if d is Direction.LONG and b.close < ema9:
+                            pos["stop"] = b.close
+                        elif d is Direction.SHORT and b.close > ema9:
+                            pos["stop"] = b.close
                 else:
-                    if b.low < pos["extreme"]:
-                        pos["extreme"] = b.low
-                        pos["stop"] = min(pos["stop"], pos["extreme"] + pos["initial_risk"])
+                    if pos.get("_hybrid_mode"):
+                        atr_mult = float(os.environ.get("HYBRID_ATR_MULT", 1.5))
+                        trail_dist = max(pos["_atr_at_entry"] * atr_mult, min_stop_dist(pos["entry"]))
+                    else:
+                        trail_dist = pos["initial_risk"]
+                    if d is Direction.LONG:
+                        if b.high > pos["extreme"]:
+                            pos["extreme"] = b.high
+                            pos["stop"] = max(pos["stop"], pos["extreme"] - trail_dist)
+                    else:
+                        if b.low < pos["extreme"]:
+                            pos["extreme"] = b.low
+                            pos["stop"] = min(pos["stop"], pos["extreme"] + trail_dist)
 
             # Check exit (phase 1 = initial static stop, phase 2 = trailing)
             if d is Direction.LONG:
@@ -341,6 +448,8 @@ def run_backtest(print_report: bool = True) -> dict:
                 owner = pos.get("owner")
                 if owner is not None:
                     owner.on_exit_filled()
+                if (tp_pnl + final_pnl) < -lockout_loss:
+                    locked_out.add(ticker)
                 del positions[ticker]
 
         # Circuit breaker — stop taking new entries
@@ -362,11 +471,19 @@ def run_backtest(print_report: bool = True) -> dict:
                     skipped_chop += 1
                     st.reset_to_watching()
                     continue
+                if ticker in locked_out:
+                    skipped_locked += 1
+                    st.reset_to_watching()
+                    continue
                 if ticker in positions or ticker in pending:
                     # Another state machine already owns this ticker
                     st.reset_to_watching()
                     continue
-                if len(positions) + len(pending) >= MAX_CONCURRENT:
+                scale = os.environ.get("SCALE_CONCURRENT", "").lower() in ("1", "true", "yes")
+                step = float(os.environ.get("SCALE_CONCURRENT_STEP", 2500))
+                cum_pnl = starting_pnl + realized_pnl
+                dynamic_max = MAX_CONCURRENT + (max(0, int(cum_pnl // step)) if scale else 0)
+                if len(positions) + len(pending) >= dynamic_max:
                     skipped_at_cap += 1
                     st.reset_to_watching()
                     continue
@@ -433,6 +550,7 @@ def run_backtest(print_report: bool = True) -> dict:
         print(f"Open MTM:       {n_open}  P&L ${open_pnl:+,.2f}")
         print(f"Skipped at cap: {skipped_at_cap}")
         print(f"Skipped chop:   {skipped_chop}")
+        print(f"Skipped locked: {skipped_locked}")
         print(f"Circuit broken: {circuit_broken}")
         for d, pnl in by_dir.items():
             print(f"  {d:<5} P&L ${pnl:+,.2f}")
@@ -454,6 +572,7 @@ def run_backtest(print_report: bool = True) -> dict:
         "by_dir": by_dir,
         "skipped_at_cap": skipped_at_cap,
         "skipped_chop": skipped_chop,
+        "skipped_locked": skipped_locked,
         "circuit_broken": circuit_broken,
         "trades": trades,
     }

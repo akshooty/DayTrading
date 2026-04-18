@@ -11,7 +11,9 @@ import sys
 from datetime import date, timedelta
 
 from backtest import run_backtest
-from backtest_historical import find_movers, prior_trading_day
+from backtest_historical import (
+    fetch_daily_bars, movers_from_cache, prior_trading_day,
+)
 
 
 def main() -> int:
@@ -25,14 +27,22 @@ def main() -> int:
         dates.append(d)
     dates.reverse()
 
-    print(f"backtesting {n} trading days: {dates[0]} -> {dates[-1]}")
-    print()
+    print(f"backtesting {n} trading days: {dates[0]} -> {dates[-1]}", flush=True)
+    print(flush=True)
+
+    # Prefetch ALL daily bars once for the full range (plus one day earlier
+    # so every target_date has a prior-day reference).
+    range_start = prior_trading_day(dates[0])
+    print(f"prefetching daily bars {range_start} -> {dates[-1]}...", flush=True)
+    all_bars = fetch_daily_bars(range_start, dates[-1])
+    print(flush=True)
 
     summaries = []
+    cum_pnl = 0.0  # threaded into run_backtest for SCALE_CONCURRENT feature
     for day in dates:
-        print(f"=== {day} ({day.strftime('%A')}) ===")
-        gainers, losers = find_movers(day)
-        print(f"universe: {len(gainers)} gainers + {len(losers)} losers")
+        print(f"=== {day} ({day.strftime('%A')}) ===", flush=True)
+        gainers, losers = movers_from_cache(day, all_bars)
+        print(f"universe: {len(gainers)} gainers + {len(losers)} losers", flush=True)
 
         longs = ",".join(g["Ticker"] for g in gainers)
         shorts = ",".join(l["Ticker"] for l in losers)
@@ -42,13 +52,14 @@ def main() -> int:
         os.environ["BACKTEST_DATE"] = day.isoformat()
 
         try:
-            s = run_backtest(print_report=False)
+            s = run_backtest(print_report=False, starting_pnl=cum_pnl)
         except Exception as e:
             print(f"  failed: {e}")
             continue
 
         s["date"] = day
         summaries.append(s)
+        cum_pnl += s["total_pnl"]
         print(
             f"  {s['n_closed']} closed ({s['n_tp']} TP), {s['n_open']} open, "
             f"skipped {s['skipped_at_cap']}@cap {s['skipped_chop']}@chop, "
@@ -97,6 +108,30 @@ def main() -> int:
     print(f"Equity base: ${equity:,.0f}")
     print(f"Total P&L:   ${total:+,.2f}  ({total/equity*100:+.3f}% of equity)")
     print(f"Days:        {len(summaries)}  ({winning_days} winners, {len(summaries)-winning_days} losers)")
+
+    # Per-strategy breakdown
+    from collections import defaultdict
+    by_strat = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "tp": 0, "long_pnl": 0.0, "short_pnl": 0.0})
+    for s in summaries:
+        for t in s.get("trades", []):
+            key = t.strategy or "Unknown"
+            by_strat[key]["pnl"] += t.pnl
+            by_strat[key]["trades"] += 1
+            if getattr(t, "tp_price", None) is not None:
+                by_strat[key]["tp"] += 1
+            if t.direction.value == "long":
+                by_strat[key]["long_pnl"] += t.pnl
+            else:
+                by_strat[key]["short_pnl"] += t.pnl
+    print()
+    print("Per-strategy breakdown:")
+    print(f"{'Strategy':<22} {'Trades':>7} {'TP':>6} {'Long $':>12} {'Short $':>12} {'Total $':>12}")
+    for k in sorted(by_strat.keys()):
+        v = by_strat[k]
+        print(
+            f"{k:<22} {v['trades']:>7} {v['tp']:>6} "
+            f"${v['long_pnl']:>+11,.0f} ${v['short_pnl']:>+11,.0f} ${v['pnl']:>+11,.0f}"
+        )
     return 0
 
 

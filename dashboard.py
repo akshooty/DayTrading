@@ -1,356 +1,209 @@
 """Streamlit dashboard for the day-trading bot.
 
-Run locally:    streamlit run dashboard.py
-Open:           http://localhost:8501
-
-For remote / online hosting, see README (Railway, Render, Fly.io).
+Surfaces simulated (backtested) trades from reports/simulated_trades.json.
+Run:  streamlit run dashboard.py
 """
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import date, datetime, time, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest
-from dotenv import load_dotenv
 
 EASTERN = ZoneInfo("America/New_York")
+SIM_PATH = "reports/simulated_trades.json"
 
-load_dotenv()
 st.set_page_config(page_title="Breakout Trader", page_icon="📈", layout="wide")
 
 
-@st.cache_resource
-def alpaca_client() -> TradingClient:
-    return TradingClient(
-        os.environ["ALPACA_API_KEY"].strip(),
-        os.environ["ALPACA_SECRET_KEY"].strip(),
-        paper=True,
-    )
-
-
-@st.cache_data(ttl=30)
-def fetch_account():
-    c = alpaca_client()
-    acct = c.get_account()
-    return {
-        "equity": float(acct.equity),
-        "last_equity": float(acct.last_equity),
-        "cash": float(acct.cash),
-        "buying_power": float(acct.buying_power),
-        "status": str(acct.status),
-        "account_number": acct.account_number,
-        "pattern_day_trader": acct.pattern_day_trader,
-    }
-
-
-@st.cache_data(ttl=30)
-def fetch_positions():
-    c = alpaca_client()
-    positions = c.get_all_positions()
-    return [
-        {
-            "symbol": p.symbol,
-            "side": str(p.side).split(".")[-1].lower(),
-            "qty": float(p.qty),
-            "avg_entry": float(p.avg_entry_price),
-            "current": float(p.current_price) if p.current_price else 0,
-            "market_value": float(p.market_value),
-            "unrealized_pl": float(p.unrealized_pl),
-            "unrealized_pct": float(p.unrealized_plpc) * 100,
-        }
-        for p in positions
-    ]
-
-
-@st.cache_data(ttl=30)
-def fetch_trades(days: int = 30):
-    """Reconstruct round-trip trades from filled orders.
-
-    Tracks signed net quantity per symbol and weighted-average entry
-    price. A trade is emitted when net qty returns to 0 (or flips to
-    the opposite direction — the flip portion becomes a new entry).
-    Scale-ins fold into the weighted-avg entry; scale-outs aggregate
-    into a VWAP exit.
-    """
-    c = alpaca_client()
-    after = datetime.now(EASTERN) - timedelta(days=days)
-    req = GetOrdersRequest(
-        status=QueryOrderStatus.ALL,
-        after=after.isoformat(),
-        limit=500,
-    )
-    orders = c.get_orders(req)
-    filled = [
-        o for o in orders
-        if str(o.status).split(".")[-1].lower() == "filled" and o.filled_at
-    ]
-    filled.sort(key=lambda o: o.filled_at)
-
-    trades: list[dict] = []
-    pos: dict[str, dict] = {}
-
-    def open_new(sym: str, qty: float, price: float, t, signed: float):
-        pos[sym] = {
-            "net": signed,
-            "entry_at": t,
-            "direction": "long" if signed > 0 else "short",
-            "entry_total": abs(signed) * price,
-            "entry_qty": abs(signed),
-            "exit_total": 0.0,
-            "exit_qty": 0.0,
-        }
-
-    def close_trade(sym: str, t):
-        p = pos[sym]
-        avg_entry = p["entry_total"] / p["entry_qty"] if p["entry_qty"] else 0
-        avg_exit = p["exit_total"] / p["exit_qty"] if p["exit_qty"] else 0
-        pnl = (
-            (avg_exit - avg_entry) * p["entry_qty"]
-            if p["direction"] == "long"
-            else (avg_entry - avg_exit) * p["entry_qty"]
-        )
-        trades.append({
-            "entry_at": p["entry_at"], "exit_at": t,
-            "symbol": sym, "direction": p["direction"],
-            "qty": p["entry_qty"],
-            "entry_price": avg_entry,
-            "exit_price": avg_exit,
-            "pnl": pnl,
-            "duration_min": (t - p["entry_at"]).total_seconds() / 60,
-            "status": "closed",
-        })
-
-    for o in filled:
-        sym = o.symbol
-        side = str(o.side).split(".")[-1].lower()
-        qty = float(o.filled_qty or 0)
-        price = float(o.filled_avg_price or 0)
-        t = o.filled_at.astimezone(EASTERN)
-        signed = qty if "buy" in side else -qty
-        if qty == 0 or price == 0:
-            continue
-
-        if sym not in pos:
-            open_new(sym, qty, price, t, signed)
-            continue
-
-        p = pos[sym]
-        same_direction = (p["net"] > 0 and signed > 0) or (p["net"] < 0 and signed < 0)
-
-        if same_direction:
-            # Scaling in — update weighted avg entry
-            p["entry_total"] += qty * price
-            p["entry_qty"] += qty
-            p["net"] += signed
-        else:
-            # Reducing, closing, or flipping direction
-            close_qty = min(qty, abs(p["net"]))
-            p["exit_total"] += close_qty * price
-            p["exit_qty"] += close_qty
-            new_net = p["net"] + signed
-
-            flipped = (p["net"] > 0 and new_net < 0) or (p["net"] < 0 and new_net > 0)
-            flat = abs(new_net) < 1e-9
-
-            if flat or flipped:
-                close_trade(sym, t)
-                if flipped:
-                    remainder = abs(new_net)
-                    open_new(sym, remainder, price, t, new_net)
-                else:
-                    del pos[sym]
-            else:
-                p["net"] = new_net
-
-    for sym, p in pos.items():
-        trades.append({
-            "entry_at": p["entry_at"], "exit_at": None,
-            "symbol": sym, "direction": p["direction"],
-            "qty": p["entry_qty"],
-            "entry_price": p["entry_total"] / p["entry_qty"] if p["entry_qty"] else 0,
-            "exit_price": None,
-            "pnl": None,
-            "duration_min": None,
-            "status": "open",
-        })
-    return trades
+@st.cache_data(ttl=60)
+def load_simulated_trades() -> list[dict]:
+    if not os.path.exists(SIM_PATH):
+        return []
+    with open(SIM_PATH) as f:
+        data = json.load(f)
+    for t in data:
+        if t.get("entry_at"):
+            t["entry_at"] = datetime.fromisoformat(t["entry_at"])
+        if t.get("exit_at"):
+            t["exit_at"] = datetime.fromisoformat(t["exit_at"])
+    return data
 
 
 @st.cache_data(ttl=300)
 def fetch_scan():
     from scanner import scan_gainers, scan_losers
-    gainers = scan_gainers()
-    losers = scan_losers()
-    return gainers, losers
+    return scan_gainers(), scan_losers()
 
 
 # ================== UI ==================
 
 st.title("📈 Breakout Trader Dashboard")
 
-acct = fetch_account()
-day_pnl = acct["equity"] - acct["last_equity"]
-day_pct = (day_pnl / acct["last_equity"] * 100) if acct["last_equity"] else 0
+trades = load_simulated_trades()
+
+if not trades:
+    st.warning(
+        f"No simulated trades found at `{SIM_PATH}`. "
+        "Run `FEED=SIP python simulate_trades.py 10` to generate the last 10 trading days."
+    )
+    st.stop()
+
+df = pd.DataFrame(trades)
+closed = df[df["status"] == "closed"].copy().sort_values("entry_at")
+dates = sorted({t["entry_at"].date() for t in trades if t.get("entry_at")})
+
+# Top summary metrics
+total_pnl = closed["pnl"].sum() if not closed.empty else 0
+wins = closed[closed["pnl"] > 0]
+losses = closed[closed["pnl"] < 0]
+win_rate = (len(wins) / len(closed) * 100) if len(closed) else 0
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Account Equity", f"${acct['equity']:,.2f}", f"${day_pnl:+,.2f} today")
-c2.metric("Cash", f"${acct['cash']:,.2f}")
-c3.metric("Buying Power", f"${acct['buying_power']:,.2f}")
-c4.metric("Day Return", f"{day_pct:+.3f}%", f"{acct['account_number']} · paper")
-
-if acct["pattern_day_trader"]:
-    st.info("Account is flagged as **Pattern Day Trader**.")
+c1.metric("Simulated trades", len(df), f"{len(closed)} closed · {len(df) - len(closed)} open EOD")
+c2.metric("Realized P&L", f"${total_pnl:+,.2f}")
+c3.metric("Win rate", f"{win_rate:.1f}%", f"{len(wins)}W / {len(losses)}L")
+c4.metric("Date range", f"{len(dates)} days", f"{dates[0]} → {dates[-1]}" if dates else "")
 
 st.divider()
 
-tab_trades, tab_positions, tab_scanner, tab_insights = st.tabs(
-    ["📊 Trades", "💼 Positions", "🔍 Scanner", "💡 Insights"]
-)
+tab_trades, tab_scanner, tab_insights = st.tabs(["📊 Trades", "🔍 Scanner", "💡 Insights"])
 
 # ----- TRADES TAB -----
 with tab_trades:
-    days_back = st.slider("Lookback (days)", 1, 90, 30, 1)
-    trades = fetch_trades(days=days_back)
-    if not trades:
-        st.info("No trades found in this window. Once the bot runs live (DRY_RUN=0), round-trip trades will show here.")
-    else:
-        df = pd.DataFrame(trades)
-        closed = df[df["status"] == "closed"].copy()
-        closed = closed.sort_values("entry_at")
+    # Filters
+    f1, f2, f3 = st.columns([2, 2, 3])
+    symbols = sorted(df["symbol"].unique().tolist())
+    directions = sorted(df["direction"].unique().tolist())
+    strategies = sorted(df.get("strategy", pd.Series(dtype=str)).dropna().unique().tolist())
 
-        # Summary metrics
-        total_pnl = closed["pnl"].sum() if not closed.empty else 0
-        wins = closed[closed["pnl"] > 0]
-        losses = closed[closed["pnl"] < 0]
-        win_rate = (len(wins) / len(closed) * 100) if len(closed) else 0
-        avg_win = wins["pnl"].mean() if not wins.empty else 0
-        avg_loss = losses["pnl"].mean() if not losses.empty else 0
-        largest_win = wins["pnl"].max() if not wins.empty else 0
-        largest_loss = losses["pnl"].min() if not losses.empty else 0
-        avg_duration = closed["duration_min"].mean() if not closed.empty else 0
+    sym_filter = f1.multiselect("Symbol", symbols, default=[])
+    dir_filter = f2.multiselect("Direction", directions, default=[])
+    strat_filter = f3.multiselect("Strategy", strategies, default=[]) if strategies else []
 
-        # Drawdown from cumulative P&L
-        if not closed.empty:
-            cum = closed["pnl"].cumsum()
-            running_peak = cum.cummax()
-            drawdown = cum - running_peak
-            max_dd = drawdown.min()
-        else:
-            cum = pd.Series(dtype=float)
-            max_dd = 0
+    filtered = df.copy()
+    if sym_filter:
+        filtered = filtered[filtered["symbol"].isin(sym_filter)]
+    if dir_filter:
+        filtered = filtered[filtered["direction"].isin(dir_filter)]
+    if strat_filter:
+        filtered = filtered[filtered["strategy"].isin(strat_filter)]
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Closed trades", len(closed))
-        c2.metric("Realized P&L", f"${total_pnl:+,.2f}")
-        c3.metric("Win rate", f"{win_rate:.1f}%", f"{len(wins)}W / {len(losses)}L")
-        c4.metric("Max drawdown", f"${max_dd:,.2f}")
+    f_closed = filtered[filtered["status"] == "closed"].copy().sort_values("entry_at")
 
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("Avg win", f"${avg_win:+,.2f}")
-        c6.metric("Avg loss", f"${avg_loss:+,.2f}")
-        c7.metric("Largest win", f"${largest_win:+,.2f}")
-        c8.metric("Avg duration", f"{avg_duration:.1f} min")
+    # Detail metrics on filtered set
+    if not f_closed.empty:
+        f_pnl = f_closed["pnl"].sum()
+        f_wins = f_closed[f_closed["pnl"] > 0]
+        f_losses = f_closed[f_closed["pnl"] < 0]
+        avg_win = f_wins["pnl"].mean() if not f_wins.empty else 0
+        avg_loss = f_losses["pnl"].mean() if not f_losses.empty else 0
+        largest_win = f_wins["pnl"].max() if not f_wins.empty else 0
+        largest_loss = f_losses["pnl"].min() if not f_losses.empty else 0
+        avg_duration = f_closed["duration_min"].mean()
 
-        # Equity curve (cumulative realized P&L)
-        if not closed.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=closed["exit_at"],
-                y=cum.values,
-                mode="lines+markers",
-                name="Cumulative P&L",
-                line=dict(color="#1f77b4"),
-            ))
-            fig.add_trace(go.Scatter(
-                x=closed["exit_at"],
-                y=drawdown.values,
-                mode="lines",
-                name="Drawdown",
-                line=dict(color="#d62728", dash="dot"),
-                yaxis="y2",
-            ))
-            fig.update_layout(
-                height=320,
-                margin=dict(l=0, r=0, t=30, b=0),
-                yaxis=dict(title="Cumulative P&L ($)"),
-                yaxis2=dict(title="Drawdown ($)", overlaying="y", side="right"),
-                legend=dict(orientation="h", y=1.08),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        cum = f_closed["pnl"].cumsum()
+        running_peak = cum.cummax()
+        drawdown = cum - running_peak
+        max_dd = drawdown.min()
 
-        # Per-trade table
-        st.subheader("Round-trip trades")
-        open_count = (df["status"] == "open").sum()
-        if open_count:
-            st.caption(f"{open_count} currently-open position(s) also listed below with blank exit fields.")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Filtered P&L", f"${f_pnl:+,.2f}", f"{len(f_closed)} closed")
+        m2.metric("Max drawdown", f"${max_dd:,.2f}")
+        m3.metric("Avg win / loss", f"${avg_win:+,.2f} / ${avg_loss:+,.2f}")
+        m4.metric("Avg duration", f"{avg_duration:.1f} min")
 
-        disp = df.copy()
-        disp["entry"] = disp.apply(
-            lambda r: f"{r['entry_at'].strftime('%m-%d %H:%M')} @ ${r['entry_price']:.2f}"
-            if pd.notna(r["entry_at"]) else "", axis=1,
+        m5, m6, m7, _ = st.columns(4)
+        m5.metric("Largest win", f"${largest_win:+,.2f}")
+        m6.metric("Largest loss", f"${largest_loss:+,.2f}")
+        m7.metric("Win rate (filtered)", f"{(len(f_wins)/len(f_closed)*100):.1f}%")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=f_closed["exit_at"], y=cum.values,
+            mode="lines+markers", name="Cumulative P&L",
+            line=dict(color="#1f77b4"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=f_closed["exit_at"], y=drawdown.values,
+            mode="lines", name="Drawdown",
+            line=dict(color="#d62728", dash="dot"),
+            yaxis="y2",
+        ))
+        fig.update_layout(
+            height=320,
+            margin=dict(l=0, r=0, t=30, b=0),
+            yaxis=dict(title="Cumulative P&L ($)"),
+            yaxis2=dict(title="Drawdown ($)", overlaying="y", side="right"),
+            legend=dict(orientation="h", y=1.08),
         )
-        disp["exit"] = disp.apply(
-            lambda r: f"{r['exit_at'].strftime('%m-%d %H:%M')} @ ${r['exit_price']:.2f}"
-            if pd.notna(r["exit_at"]) and pd.notna(r["exit_price"]) else "—",
-            axis=1,
-        )
-        disp["duration"] = disp["duration_min"].apply(
-            lambda x: f"{x:.0f}m" if pd.notna(x) else "—"
-        )
-        disp["pnl_str"] = disp["pnl"].apply(
-            lambda x: f"${x:+,.2f}" if pd.notna(x) else "—"
-        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.dataframe(
-            disp[["symbol", "direction", "qty", "entry", "exit", "duration", "pnl_str", "status"]]
-                .rename(columns={"pnl_str": "P&L"})
-                .sort_values("entry", ascending=False),
-            use_container_width=True,
-            hide_index=True,
+        # Daily P&L bar chart
+        daily = f_closed.copy()
+        daily["day"] = daily["exit_at"].dt.date
+        by_day = daily.groupby("day")["pnl"].sum().reset_index()
+        bar = go.Figure(go.Bar(
+            x=by_day["day"], y=by_day["pnl"],
+            marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in by_day["pnl"]],
+        ))
+        bar.update_layout(
+            height=240, margin=dict(l=0, r=0, t=30, b=0),
+            title="Daily realized P&L",
+            yaxis_title="P&L ($)",
         )
+        st.plotly_chart(bar, use_container_width=True)
 
-# ----- POSITIONS TAB -----
-with tab_positions:
-    st.subheader("Open Positions")
-    positions = fetch_positions()
-    if not positions:
-        st.info("No open positions.")
-    else:
-        df = pd.DataFrame(positions)
-        total_mv = df["market_value"].sum()
-        total_upl = df["unrealized_pl"].sum()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Positions", len(df))
-        c2.metric("Market value", f"${total_mv:,.2f}")
-        c3.metric("Unrealized P&L", f"${total_upl:+,.2f}")
+    # Per-trade table
+    st.subheader("Round-trip trades")
+    disp = filtered.copy()
+    disp["entry"] = disp.apply(
+        lambda r: f"{r['entry_at'].strftime('%m-%d %H:%M')} @ ${r['entry_price']:.2f}"
+        if pd.notna(r["entry_at"]) else "", axis=1,
+    )
+    disp["exit"] = disp.apply(
+        lambda r: f"{r['exit_at'].strftime('%m-%d %H:%M')} @ ${r['exit_price']:.2f}"
+        if pd.notna(r["exit_at"]) and pd.notna(r["exit_price"]) else "—",
+        axis=1,
+    )
+    disp["duration"] = disp["duration_min"].apply(lambda x: f"{x:.0f}m" if pd.notna(x) else "—")
+    disp["pnl_str"] = disp["pnl"].apply(lambda x: f"${x:+,.2f}" if pd.notna(x) else "—")
 
-        df_display = df.copy()
-        df_display["unrealized_pct"] = df_display["unrealized_pct"].apply(lambda x: f"{x:+.2f}%")
-        df_display["avg_entry"] = df_display["avg_entry"].apply(lambda x: f"${x:.2f}")
-        df_display["current"] = df_display["current"].apply(lambda x: f"${x:.2f}")
-        df_display["market_value"] = df_display["market_value"].apply(lambda x: f"${x:,.2f}")
-        df_display["unrealized_pl"] = df_display["unrealized_pl"].apply(lambda x: f"${x:+,.2f}")
+    cols = ["symbol", "direction", "qty", "entry", "exit", "duration", "pnl_str", "status"]
+    if "strategy" in disp.columns:
+        cols.insert(2, "strategy")
 
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+    st.dataframe(
+        disp[cols].rename(columns={"pnl_str": "P&L"}).sort_values("entry", ascending=False),
+        use_container_width=True, hide_index=True,
+    )
+
+    # Download button — raw JSON so users can do their own analysis
+    with open(SIM_PATH, "rb") as f:
+        st.download_button(
+            "📥 Download raw simulated_trades.json",
+            f.read(), file_name="simulated_trades.json", mime="application/json",
+        )
 
 # ----- SCANNER TAB -----
 with tab_scanner:
     st.subheader("Today's Universe")
-    col_a, col_b = st.columns([1, 5])
+    col_a, _ = st.columns([1, 5])
     if col_a.button("🔄 Refresh scan", help="Calls Finviz; takes ~5 sec"):
         st.cache_data.clear()
         st.rerun()
 
-    with st.spinner("Scanning Finviz..."):
-        gainers, losers = fetch_scan()
+    try:
+        with st.spinner("Scanning Finviz..."):
+            gainers, losers = fetch_scan()
+    except Exception as e:
+        st.error(f"Scanner failed: {e}")
+        gainers, losers = [], []
 
     g_col, l_col = st.columns(2)
     with g_col:
@@ -376,8 +229,7 @@ with tab_insights:
     report_path = "reports/year_analysis_2026-04-17.md"
     if os.path.exists(report_path):
         with open(report_path) as f:
-            content = f.read()
-        st.markdown(content)
+            st.markdown(f.read())
     else:
         st.info("No backtest report found. Run `python backtest_week.py 22` to generate history.")
 
@@ -404,6 +256,7 @@ Guardrails:
 
 st.divider()
 st.caption(
-    f"Last refreshed: {datetime.now(EASTERN).strftime('%Y-%m-%d %H:%M:%S %Z')}. "
-    f"Data cache: 30s (account/orders/positions), 5min (scanner)."
+    f"Last refreshed: {datetime.now(EASTERN).strftime('%Y-%m-%d %H:%M:%S %Z')} · "
+    f"Source: {SIM_PATH} ({len(trades)} trades) · "
+    "Regenerate with `FEED=SIP python simulate_trades.py N`."
 )

@@ -28,7 +28,8 @@ from dotenv import load_dotenv
 EASTERN = ZoneInfo("America/New_York")
 MIN_CHANGE_PCT = 5.0
 MIN_VOLUME = 2_000_000
-MIN_PRICE = 1.0
+MIN_PRICE = float(os.environ.get("MIN_PRICE", 1.0))
+MAX_PRICE = float(os.environ.get("MAX_PRICE", 1e9))
 TOP_N = 50  # cap universe to top-N movers per side to keep bar fetch reasonable
 
 
@@ -96,14 +97,17 @@ def movers_from_cache(target_date: date, all_bars: dict[str, list]) -> tuple[lis
             continue
         target_bar = by_date[target_date]
         prev_bar = by_date[prev]
-        if target_bar.close < MIN_PRICE or target_bar.volume < MIN_VOLUME:
+        if target_bar.close < MIN_PRICE or target_bar.close > MAX_PRICE or target_bar.volume < MIN_VOLUME:
             continue
         change = (target_bar.close - prev_bar.close) / prev_bar.close * 100
         row = {
             "Ticker": sym, "Change": change, "Volume": target_bar.volume,
             "Close": target_bar.close,
         }
+        no_gap_down_longs = os.environ.get("NO_GAP_DOWN_LONGS", "").lower() in ("1", "true", "yes")
         if change >= MIN_CHANGE_PCT:
+            if no_gap_down_longs and target_bar.open < prev_bar.close:
+                continue
             gainers.append(row)
         elif change <= -MIN_CHANGE_PCT:
             losers.append(row)
