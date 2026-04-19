@@ -14,10 +14,15 @@ Env flags:
   DRY_RUN=1            disable order submission (log only)
   WATCHLIST=...        long-only ticker override for testing
   LOG_LEVEL=...        DEBUG|INFO (default INFO)
-  LOCKOUT_LOSS         per-trade loss > $X blocks same-ticker re-entry (150)
+  LOCKOUT_LOSS         re-entry blocked if loss > $X (default 0 => any loss)
   HYBRID_TP_PCT        Phase 1 take-profit % (4)
   HYBRID_ATR_PERIOD    bars used for ATR (14)
   HYBRID_ATR_MULT      Phase 2 trail = ATR * mult (1.5)
+  SHORT_SIZE_MULT      qty multiplier on shorts (1.0)
+  MEME_SIZE_MULT       qty multiplier on leveraged ETFs/meme (0.5)
+  REGIME_SIZE_MULT     qty multiplier when SPY gap > REGIME_GAP_PCT (0.5)
+  REGIME_GAP_PCT       SPY |today_open vs prior_close| % to trip regime (1.5)
+  BLOCKED_TICKERS      comma-list of tickers to never trade (RPAY)
   GMAIL_USER           sender Gmail address for trade alerts
   GMAIL_APP_PASSWORD   16-char Gmail app password
   EMAIL_TO             recipient for trade alerts (default: GMAIL_USER)
@@ -29,11 +34,14 @@ import asyncio
 import logging
 import os
 import smtplib
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
+from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import (
@@ -71,10 +79,24 @@ MAX_RISK_PER_TRADE = 200.0
 LIMIT_OFFSET = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.01
 
-LOCKOUT_LOSS = float(os.environ.get("LOCKOUT_LOSS", 150))
+LOCKOUT_LOSS = float(os.environ.get("LOCKOUT_LOSS", 0))  # 0 => any losing close locks ticker
 HYBRID_TP_PCT = float(os.environ.get("HYBRID_TP_PCT", 4))
 HYBRID_ATR_PERIOD = int(os.environ.get("HYBRID_ATR_PERIOD", 14))
 HYBRID_ATR_MULT = float(os.environ.get("HYBRID_ATR_MULT", 1.5))
+
+# Tradervue-log insights (mirrored from backtest.py).
+SHORT_SIZE_MULT = float(os.environ.get("SHORT_SIZE_MULT", 1.0))
+MEME_SIZE_MULT = float(os.environ.get("MEME_SIZE_MULT", 0.5))
+REGIME_SIZE_MULT = float(os.environ.get("REGIME_SIZE_MULT", 0.5))
+REGIME_GAP_PCT = float(os.environ.get("REGIME_GAP_PCT", 1.5)) / 100.0
+MEME_LEVERAGED_TICKERS = {
+    "SOXL", "SOXS", "TSLL", "TSLZ", "MSTU", "MSTZ", "UVIX", "UVXY",
+    "OPEN", "BBAI", "LCID", "PLUG",
+    "SQQQ", "TQQQ", "SPXL", "SPXS", "FNGU", "FNGD", "NVDL", "NVDS",
+}
+BLOCKED_TICKERS = {
+    s.strip().upper() for s in os.environ.get("BLOCKED_TICKERS", "RPAY").split(",") if s.strip()
+}
 
 log = logging.getLogger("trader")
 
@@ -124,6 +146,7 @@ class BreakoutTrader:
         self.trading = TradingClient(key, secret, paper=True)
         self.data_stream = StockDataStream(key, secret)
         self.trade_stream = TradingStream(key, secret, paper=True)
+        self.data_client = StockHistoricalDataClient(key, secret)
         self.states: dict[str, BreakoutState] = {}
         self.entry_orders: dict[str, str] = {}
         self.positions: dict[str, dict] = {}
@@ -131,6 +154,42 @@ class BreakoutTrader:
         self.equity: float = 0.0
         self.realized_pnl: float = 0.0
         self.circuit_broken: bool = False
+        self.regime_reduced: bool = False
+
+    def _check_regime(self) -> bool:
+        """Volatile session if SPY |latest vs prior_close| > REGIME_GAP_PCT.
+
+        Runs at startup (~9:25 ET, 5 min before open). Latest trade is
+        the most recent pre-market print; falls back to free-tier feed
+        if SIP not available. Any failure => proceed at full size.
+        """
+        try:
+            today = datetime.now(EASTERN).date()
+            req = StockBarsRequest(
+                symbol_or_symbols=["SPY"],
+                timeframe=TimeFrame.Day,
+                start=datetime.combine(today - timedelta(days=10), time(0, 0)),
+                end=datetime.combine(today, time(0, 0)),
+            )
+            bars = self.data_client.get_stock_bars(req).data.get("SPY", [])
+            prior = next((b for b in reversed(bars) if b.timestamp.date() < today), None)
+            if not prior or prior.close <= 0:
+                return False
+            trade = self.data_client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=["SPY"])
+            ).get("SPY")
+            if trade is None:
+                return False
+            current = float(trade.price)
+            gap = abs(current - float(prior.close)) / float(prior.close)
+            log.info(
+                "regime: SPY prior_close=%.2f latest=%.2f gap=%.2f%% (threshold %.2f%%)",
+                prior.close, current, gap * 100, REGIME_GAP_PCT * 100,
+            )
+            return gap > REGIME_GAP_PCT
+        except Exception as e:
+            log.warning("regime check failed (%s) — proceeding at full size", e)
+            return False
 
     def load_watchlist(self) -> dict[str, Direction]:
         def valid(s: str) -> bool:
@@ -181,12 +240,16 @@ class BreakoutTrader:
             log.info("%s ARM skipped (circuit breaker)", s.symbol)
             self.states[s.symbol].reset_to_watching()
             return
+        if s.symbol in BLOCKED_TICKERS:
+            log.info("%s ARM skipped (blocked ticker)", s.symbol)
+            self.states[s.symbol].reset_to_watching()
+            return
         if self._in_chop_now():
             log.info("%s ARM skipped (11:30-14:00 ET chop window)", s.symbol)
             self.states[s.symbol].reset_to_watching()
             return
         if s.symbol in self.locked_out:
-            log.info("%s ARM skipped (locked out — prior loss > $%.0f)", s.symbol, LOCKOUT_LOSS)
+            log.info("%s ARM skipped (locked out — prior losing close)", s.symbol)
             self.states[s.symbol].reset_to_watching()
             return
         busy = len(self.entry_orders) + len(self.positions)
@@ -200,10 +263,22 @@ class BreakoutTrader:
             max_deployment=MAX_DEPLOYMENT,
             max_risk=MAX_RISK_PER_TRADE,
         )
+        size_factors = []
+        if s.direction is Direction.SHORT and SHORT_SIZE_MULT != 1.0:
+            qty = int(qty * SHORT_SIZE_MULT)
+            size_factors.append(f"short x{SHORT_SIZE_MULT}")
+        if s.symbol in MEME_LEVERAGED_TICKERS:
+            qty = int(qty * MEME_SIZE_MULT)
+            size_factors.append(f"meme x{MEME_SIZE_MULT}")
+        if self.regime_reduced:
+            qty = int(qty * REGIME_SIZE_MULT)
+            size_factors.append(f"regime x{REGIME_SIZE_MULT}")
         if qty < 2:
             log.warning("%s ARM skipped — qty %d (need >= 2 for hybrid TP)", s.symbol, qty)
             self.states[s.symbol].reset_to_watching()
             return
+        if size_factors:
+            log.info("%s size adjustments: %s -> qty=%d", s.symbol, ", ".join(size_factors), qty)
 
         log.info(
             "%s ARM dir=%s entry=%.2f stop=%.2f qty=%d deploy=$%.2f",
@@ -460,7 +535,7 @@ class BreakoutTrader:
         if total_trade_pnl < -LOCKOUT_LOSS:
             self.locked_out.add(sym)
             log.info(
-                "%s locked out (trade loss $%.2f exceeds $%.0f threshold)",
+                "%s locked out (trade pnl $%+.2f, threshold $-%.0f)",
                 sym, total_trade_pnl, LOCKOUT_LOSS,
             )
 
@@ -511,13 +586,22 @@ class BreakoutTrader:
     async def run(self) -> None:
         acct = self.trading.get_account()
         self.equity = float(acct.equity)
+        self.regime_reduced = self._check_regime()
         log.info(
-            "equity=$%.2f dry_run=%s lockout=$%.0f hybrid_tp=%.1f%% atr_mult=%.1f",
+            "equity=$%.2f dry_run=%s lockout=$%.0f hybrid_tp=%.1f%% atr_mult=%.1f "
+            "short_mult=%.2f meme_mult=%.2f regime_mult=%.2f regime_reduced=%s blocked=%s",
             self.equity, self.dry_run,
             LOCKOUT_LOSS, HYBRID_TP_PCT, HYBRID_ATR_MULT,
+            SHORT_SIZE_MULT, MEME_SIZE_MULT, REGIME_SIZE_MULT,
+            self.regime_reduced, sorted(BLOCKED_TICKERS),
         )
 
         watchlist = self.load_watchlist()
+        dropped = [s for s in watchlist if s in BLOCKED_TICKERS]
+        if dropped:
+            log.info("dropping blocked tickers from watchlist: %s", dropped)
+            for s in dropped:
+                watchlist.pop(s, None)
         if not watchlist:
             log.warning("empty watchlist — exiting")
             return

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from alpaca.data.enums import DataFeed
@@ -58,6 +58,34 @@ CHOP_END = _parse_et("CHOP_END_ET", time(14, 0))
 _eod_raw = os.environ.get("EOD_CUTOFF_ET")
 EOD_CUTOFF: time | None = _parse_et("EOD_CUTOFF_ET", time(15, 55)) if _eod_raw else None
 DAILY_LOSS_LIMIT_PCT = 0.01
+
+# Tradervue-log insights:
+#  - shorts have PF 0.52 vs longs 5.76 -> halve short qty
+#  - leveraged ETFs / meme small-caps move 5-15% intraday and chop our
+#    small-cap-mean-reversion playbook -> halve qty
+#  - regime gap (SPY |open vs prior close| > 1.5%) flags volatile sessions -> halve qty
+#  - 9:30-10:00 small-cap fades chop; ban entries in that window
+#  - revenge-trade prevention: lock the ticker after ANY losing close
+#  - RPAY: chronic loser, hard pause
+SHORT_SIZE_MULT = float(os.environ.get("SHORT_SIZE_MULT", 1.0))  # algo's shorts already PF>1; no haircut
+MEME_SIZE_MULT = float(os.environ.get("MEME_SIZE_MULT", 0.5))
+REGIME_SIZE_MULT = float(os.environ.get("REGIME_SIZE_MULT", 0.5))
+REGIME_GAP_PCT = float(os.environ.get("REGIME_GAP_PCT", 1.5)) / 100.0
+MEME_LEVERAGED_TICKERS = {
+    "SOXL", "SOXS", "TSLL", "TSLZ", "MSTU", "MSTZ", "UVIX", "UVXY",
+    "OPEN", "BBAI", "LCID", "PLUG",
+    "SQQQ", "TQQQ", "SPXL", "SPXS", "FNGU", "FNGD", "NVDL", "NVDS",
+}
+BLOCKED_TICKERS = {s.strip().upper() for s in os.environ.get("BLOCKED_TICKERS", "RPAY").split(",") if s.strip()}
+# 9:30-10:00 block disabled by default: catalyst-driven breakouts on this
+# universe were profitable in the 20-day window. Set OPENING_BLOCK_END_ET
+# to e.g. "09:45" or "10:00" to enable.
+OPENING_BLOCK_END = _parse_et("OPENING_BLOCK_END_ET", time(9, 30))
+
+
+def _in_opening_block(ts_utc: datetime) -> bool:
+    t = ts_utc.astimezone(EASTERN).time()
+    return time(9, 30) <= t < OPENING_BLOCK_END
 
 
 @dataclass
@@ -164,6 +192,34 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
     )
     resp = client.get_stock_bars(req)
 
+    # Regime filter: if SPY |today_open vs prior_close| gap > threshold,
+    # volatility is elevated (tariff-shock-style days). Halve sizes.
+    regime_reduced = False
+    try:
+        spy_req = StockBarsRequest(
+            symbol_or_symbols=["SPY"],
+            timeframe=TimeFrame.Day,
+            start=start_et - timedelta(days=10),
+            end=start_et + timedelta(days=1),
+            feed=feed,
+        )
+        spy_bars = client.get_stock_bars(spy_req).data.get("SPY", [])
+        target_day = start_et.date()
+        today_bar = next((x for x in spy_bars if x.timestamp.date() == target_day), None)
+        prior_bar = None
+        for x in reversed(spy_bars):
+            if x.timestamp.date() < target_day:
+                prior_bar = x
+                break
+        if today_bar and prior_bar and prior_bar.close > 0:
+            gap = abs(today_bar.open - prior_bar.close) / prior_bar.close
+            regime_reduced = gap > REGIME_GAP_PCT
+            if print_report and regime_reduced:
+                print(f"regime: SPY gap {gap*100:.2f}% > {REGIME_GAP_PCT*100:.2f}% -> sizes halved")
+    except Exception as e:
+        if print_report:
+            print(f"regime check failed: {e}; proceeding at full size")
+
     events = []
     for ticker, bars in resp.data.items():
         for b in bars:
@@ -185,11 +241,13 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
     pending: dict[str, tuple[ArmSignal, object]] = {}
     ma9_5m: dict[str, dict] = {}  # per-ticker 5m EMA(9) state
     trades: list[Trade] = []
-    locked_out: set[str] = set()  # tickers stopped out >$LOCKOUT_LOSS today; no re-entry
-    lockout_loss = float(os.environ.get("LOCKOUT_LOSS", 150))
+    locked_out: set[str] = set()  # tickers with a losing close today; no re-entry
+    lockout_loss = float(os.environ.get("LOCKOUT_LOSS", 0))  # 0 => lock on any net loss
     skipped_at_cap = 0
     skipped_chop = 0
     skipped_locked = 0
+    skipped_opening = 0
+    skipped_blocked = 0
     circuit_broken = False
     realized_pnl = 0.0
 
@@ -265,6 +323,12 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     max_deployment=MAX_DEPLOYMENT,
                     max_risk=MAX_RISK_PER_TRADE,
                 )
+                if sig.direction is Direction.SHORT:
+                    qty = int(qty * SHORT_SIZE_MULT)
+                if ticker in MEME_LEVERAGED_TICKERS:
+                    qty = int(qty * MEME_SIZE_MULT)
+                if regime_reduced:
+                    qty = int(qty * REGIME_SIZE_MULT)
                 if qty >= 2:  # need at least 2 to split 50/50
                     initial_risk = max(abs(fill - sig.stop), min_stop_dist(fill))
                     hybrid_mode = os.environ.get("HYBRID_TP", "1").lower() in ("1", "true", "yes")
@@ -467,6 +531,14 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                 if circuit_broken:
                     st.reset_to_watching()
                     continue
+                if ticker in BLOCKED_TICKERS:
+                    skipped_blocked += 1
+                    st.reset_to_watching()
+                    continue
+                if _in_opening_block(ts):
+                    skipped_opening += 1
+                    st.reset_to_watching()
+                    continue
                 if _in_chop(ts):
                     skipped_chop += 1
                     st.reset_to_watching()
@@ -548,10 +620,13 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         print()
         print(f"Closed:         {n_closed}  (hit partial TP: {n_with_tp})  P&L ${closed_pnl:+,.2f}")
         print(f"Open MTM:       {n_open}  P&L ${open_pnl:+,.2f}")
-        print(f"Skipped at cap: {skipped_at_cap}")
-        print(f"Skipped chop:   {skipped_chop}")
-        print(f"Skipped locked: {skipped_locked}")
-        print(f"Circuit broken: {circuit_broken}")
+        print(f"Skipped at cap:  {skipped_at_cap}")
+        print(f"Skipped chop:    {skipped_chop}")
+        print(f"Skipped locked:  {skipped_locked}")
+        print(f"Skipped opening: {skipped_opening}")
+        print(f"Skipped blocked: {skipped_blocked}")
+        print(f"Regime reduced:  {regime_reduced}")
+        print(f"Circuit broken:  {circuit_broken}")
         for d, pnl in by_dir.items():
             print(f"  {d:<5} P&L ${pnl:+,.2f}")
         total = closed_pnl + open_pnl
@@ -573,6 +648,9 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         "skipped_at_cap": skipped_at_cap,
         "skipped_chop": skipped_chop,
         "skipped_locked": skipped_locked,
+        "skipped_opening": skipped_opening,
+        "skipped_blocked": skipped_blocked,
+        "regime_reduced": regime_reduced,
         "circuit_broken": circuit_broken,
         "trades": trades,
     }
