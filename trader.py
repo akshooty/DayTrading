@@ -151,6 +151,10 @@ class BreakoutTrader:
         self.entry_orders: dict[str, str] = {}
         self.positions: dict[str, dict] = {}
         self.locked_out: set[str] = set()
+        # Tickers whose entry order was already submitted today (any outcome:
+        # filled, cancelled, expired). One shot per ticker per day — prevents
+        # unfilled entries from re-arming after the state machine resets.
+        self.used_setups: set[str] = set()
         self.equity: float = 0.0
         self.realized_pnl: float = 0.0
         self.circuit_broken: bool = False
@@ -244,6 +248,10 @@ class BreakoutTrader:
             log.info("%s ARM skipped (blocked ticker)", s.symbol)
             self.states[s.symbol].reset_to_watching()
             return
+        if s.symbol in self.used_setups:
+            log.info("%s ARM skipped (entry already placed today — one shot per ticker)", s.symbol)
+            self.states[s.symbol].reset_to_watching()
+            return
         if self._in_chop_now():
             log.info("%s ARM skipped (11:30-14:00 ET chop window)", s.symbol)
             self.states[s.symbol].reset_to_watching()
@@ -314,15 +322,88 @@ class BreakoutTrader:
 
         order = self.trading.submit_order(req)
         self.entry_orders[s.symbol] = str(order.id)
+        # Mark this ticker as spent for the day. Any subsequent state-
+        # machine arm for this symbol is dropped by _handle_arm even if
+        # this entry gets cancelled or expires unfilled.
+        self.used_setups.add(s.symbol)
+
+    def _confirm_order(self, order_id: str):
+        """Re-query Alpaca for the authoritative order state.
+
+        Returns the Order object. Raises on failure — callers must handle
+        the exception and decide whether to proceed with stream data.
+        """
+        return self.trading.get_order_by_id(order_id)
 
     async def _handle_reset(self, s: ResetSignal) -> None:
         log.info("%s RESET dir=%s (setup invalidated)", s.symbol, s.direction.value)
-        oid = self.entry_orders.pop(s.symbol, None)
-        if oid and not self.dry_run:
+        # Do NOT pop entry_orders here. If the cancel races with a fill
+        # (order already filling at Alpaca when we sent the cancel), the
+        # subsequent "fill" / "canceled" trade event must still match
+        # entry_orders[sym] so exits get sized for any real shares owned.
+        # The trade-update handler pops entry_orders once the order is
+        # in a terminal state.
+        oid = self.entry_orders.get(s.symbol)
+        if not oid or self.dry_run:
+            return
+        await self._confirm_cancel(s.symbol, oid)
+
+    async def _confirm_cancel(self, sym: str, oid: str) -> None:
+        """Cancel an outstanding order and confirm Alpaca accepted it.
+
+        Retries up to 3 times with a short poll between attempts. The
+        cancel is confirmed when the order's status is terminal
+        (canceled / expired / rejected / filled / done_for_day). If we
+        cannot confirm after retries, escalate via email — the order
+        may still be live and will need manual attention.
+        """
+        terminal = {"canceled", "expired", "rejected", "filled", "done_for_day"}
+        for attempt in range(1, 4):
             try:
                 self.trading.cancel_order_by_id(oid)
+                log.info("%s cancel request sent (attempt %d) for %s", sym, attempt, oid)
             except Exception as e:
-                log.warning("%s cancel failed: %s", s.symbol, e)
+                # Alpaca rejects cancel if the order is already terminal
+                # (e.g. filled before our cancel landed). The poll below
+                # will verify the actual state.
+                log.info("%s cancel request attempt %d raised: %s", sym, attempt, e)
+
+            await asyncio.sleep(0.5)
+            try:
+                o = self._confirm_order(oid)
+                status = getattr(o, "status", None)
+                status_str = status.value if hasattr(status, "value") else str(status).lower()
+                if status_str in terminal:
+                    log.info(
+                        "%s entry %s confirmed terminal=%s after %d attempt(s)",
+                        sym, oid, status_str, attempt,
+                    )
+                    return
+                log.warning(
+                    "%s entry %s status=%s after cancel attempt %d — retrying",
+                    sym, oid, status_str, attempt,
+                )
+            except Exception as e:
+                log.warning(
+                    "%s cancel-confirm re-query failed (attempt %d): %s",
+                    sym, attempt, e,
+                )
+
+        # Out of retries — order may still be live at Alpaca. Alert.
+        log.error(
+            "%s FAILED to confirm entry %s cancellation after 3 attempts — manual check required",
+            sym, oid,
+        )
+        await _email(
+            f"[Trader] CANCEL UNCONFIRMED {sym}",
+            (
+                f"Symbol: {sym}\n"
+                f"Order:  {oid}\n"
+                f"Issue:  Entry cancellation could not be confirmed after 3 attempts.\n"
+                f"        The order may still be live at Alpaca — check manually.\n"
+                f"Time:   {datetime.now(EASTERN).isoformat()}\n"
+            ),
+        )
 
     async def on_trade_update(self, msg) -> None:
         order = msg.order
@@ -343,28 +424,63 @@ class BreakoutTrader:
                 await self._handle_tp1_fill(st, order, pos)
             elif oid == pos.get("stop_order_id"):
                 await self._handle_exit_fill(st, order, pos)
-        elif msg.event in ("canceled", "expired", "rejected"):
+        elif msg.event in ("canceled", "expired", "rejected", "done_for_day"):
             if oid == self.entry_orders.get(sym):
+                # Entry terminated non-fill. If it accrued any partial
+                # fills, we own shares that need protection — route
+                # through the normal fill path so exits get sized to the
+                # partial qty. Else clear state.
+                partial = None
+                try:
+                    partial = self._confirm_order(oid)
+                except Exception as e:
+                    log.warning("%s entry cleanup re-query failed: %s", sym, e)
+                partial_qty = int(float(getattr(partial, "filled_qty", 0) or 0))
+                if partial_qty > 0:
+                    log.warning(
+                        "%s entry %s with partial fill qty=%d — placing exits for partial",
+                        sym, msg.event, partial_qty,
+                    )
+                    await self._handle_entry_fill(st, partial)
+                    return
                 self.entry_orders.pop(sym, None)
                 if st.state is State.ARMED:
                     st.reset_to_watching()
 
     async def _handle_entry_fill(self, st: BreakoutState, order) -> None:
         sym = order.symbol
-        filled = int(float(order.filled_qty or 0))
-        price = float(order.filled_avg_price or 0)
+        oid = str(order.id)
+        # Before sizing any exits, re-query Alpaca for the authoritative
+        # order state. The stream snapshot is usually correct, but we
+        # confirm from the REST API so exits are sized off the real
+        # filled_qty — never a stale or partial stream event.
+        confirmed = order
+        try:
+            confirmed = self._confirm_order(oid)
+        except Exception as e:
+            log.warning("%s entry re-query failed (%s) — using stream snapshot", sym, e)
+        filled = int(float(confirmed.filled_qty or 0))
+        price = float(confirmed.filled_avg_price or 0)
+        status = getattr(confirmed, "status", "unknown")
+        status_str = status.value if hasattr(status, "value") else str(status).lower()
         log.info(
-            "%s ENTRY FILL dir=%s qty=%d @ %.2f",
-            sym, st.direction.value, filled, price,
+            "%s ENTRY confirmed dir=%s status=%s qty=%d @ %.2f",
+            sym, st.direction.value, status_str, filled, price,
         )
         st.on_entry_filled()
         self.entry_orders.pop(sym, None)
 
         exit_side = OrderSide.SELL if st.direction is Direction.LONG else OrderSide.BUY
 
+        if filled <= 0:
+            log.warning("%s entry confirm returned qty=0 — aborting exit setup", sym)
+            if st.state is State.IN_POSITION:
+                st.on_exit_filled()
+            return
+
         if filled < 2:
             log.warning("%s entry filled qty=%d (<2) — closing immediately", sym, filled)
-            if filled > 0 and not self.dry_run:
+            if not self.dry_run:
                 try:
                     self.trading.submit_order(MarketOrderRequest(
                         symbol=sym, qty=filled, side=exit_side,
@@ -420,12 +536,46 @@ class BreakoutTrader:
                 limit_price=tp_level,
             ))
             pos["tp_order_id"] = str(tp_order.id)
+            # Reconcile: stop must cover every share (Phase 1). TP takes
+            # half; the remaining half is covered by the stop until TP
+            # fills and we swap in a trailing stop on the remainder.
+            stop_qty = int(float(stop_order.qty or 0))
+            tp_qty = int(float(tp_order.qty or 0))
+            if stop_qty != filled:
+                log.error(
+                    "%s PROTECTION MISMATCH: stop qty=%d but entry filled=%d — emergency close",
+                    sym, stop_qty, filled,
+                )
+                try:
+                    self.trading.cancel_order_by_id(str(stop_order.id))
+                except Exception:
+                    pass
+                try:
+                    self.trading.cancel_order_by_id(str(tp_order.id))
+                except Exception:
+                    pass
+                try:
+                    self.trading.submit_order(MarketOrderRequest(
+                        symbol=sym, qty=filled, side=exit_side,
+                        time_in_force=TimeInForce.DAY,
+                    ))
+                except Exception as e:
+                    log.error("%s emergency close failed: %s", sym, e)
+                return
             log.info(
-                "%s Phase1 orders: stop=%.2f (qty=%d), tp=%.2f (qty=%d), atr=%.2f",
-                sym, initial_stop, filled, tp_level, half, atr,
+                "%s Phase1 orders ok: stop qty=%d (==entry %d), tp qty=%d (half), atr=%.2f",
+                sym, stop_qty, filled, tp_qty, atr,
             )
         except Exception as e:
-            log.error("%s failed to submit Phase1 orders: %s", sym, e)
+            log.error("%s failed to submit Phase1 orders: %s — attempting emergency close", sym, e)
+            try:
+                self.trading.submit_order(MarketOrderRequest(
+                    symbol=sym, qty=filled, side=exit_side,
+                    time_in_force=TimeInForce.DAY,
+                ))
+            except Exception as e2:
+                log.error("%s emergency close also failed: %s", sym, e2)
+            return
 
         await _email(
             f"[Trader] ENTRY {sym} {st.direction.value.upper()} {filled}@${price:.2f}",
@@ -468,29 +618,68 @@ class BreakoutTrader:
                 self.positions.pop(sym, None)
             return
 
-        # Cancel static stop covering full qty; submit trailing stop on remainder.
+        # Cancel static stop covering full qty; submit trailing stop on
+        # the remainder. Confirm the cancel took effect before the new
+        # stop goes in — otherwise we'd have overlapping orders that
+        # could flatten us at an unwanted price.
         old_stop_id = pos.get("stop_order_id")
         pos["stop_order_id"] = None
+        cancel_ok = True
         if old_stop_id:
             try:
                 self.trading.cancel_order_by_id(old_stop_id)
+                try:
+                    confirmed = self._confirm_order(old_stop_id)
+                    status = getattr(confirmed, "status", "unknown")
+                    status_str = status.value if hasattr(status, "value") else str(status).lower()
+                    if status_str not in ("canceled", "expired", "filled"):
+                        cancel_ok = False
+                        log.warning(
+                            "%s old stop %s still live (status=%s) — skipping trail submit",
+                            sym, old_stop_id, status_str,
+                        )
+                except Exception as e:
+                    log.warning("%s old stop re-query failed: %s", sym, e)
             except Exception as e:
+                cancel_ok = False
                 log.warning("%s cancel stop failed: %s", sym, e)
 
         trail = round(max(pos["atr_at_entry"] * HYBRID_ATR_MULT, min_stop_dist(pos["entry"])), 2)
         exit_side = OrderSide.SELL if d is Direction.LONG else OrderSide.BUY
-        try:
-            trail_order = self.trading.submit_order(TrailingStopOrderRequest(
-                symbol=sym, qty=pos["remaining_qty"], side=exit_side,
-                time_in_force=TimeInForce.DAY, trail_price=trail,
-            ))
-            pos["stop_order_id"] = str(trail_order.id)
-            log.info(
-                "%s Phase2 trail=$%.2f qty=%d (atr=%.2f mult=%.2f)",
-                sym, trail, pos["remaining_qty"], pos["atr_at_entry"], HYBRID_ATR_MULT,
+        if not cancel_ok:
+            log.error(
+                "%s Phase2 skipped: old stop still live, covers full qty "
+                "(remaining %d is already protected)",
+                sym, pos["remaining_qty"],
             )
-        except Exception as e:
-            log.error("%s failed to submit trail: %s", sym, e)
+        else:
+            try:
+                trail_order = self.trading.submit_order(TrailingStopOrderRequest(
+                    symbol=sym, qty=pos["remaining_qty"], side=exit_side,
+                    time_in_force=TimeInForce.DAY, trail_price=trail,
+                ))
+                pos["stop_order_id"] = str(trail_order.id)
+                trail_qty = int(float(trail_order.qty or 0))
+                if trail_qty != pos["remaining_qty"]:
+                    log.error(
+                        "%s TRAIL MISMATCH: trail qty=%d but remaining=%d",
+                        sym, trail_qty, pos["remaining_qty"],
+                    )
+                log.info(
+                    "%s Phase2 trail=$%.2f qty=%d (==remaining %d, atr=%.2f mult=%.2f)",
+                    sym, trail, trail_qty, pos["remaining_qty"],
+                    pos["atr_at_entry"], HYBRID_ATR_MULT,
+                )
+            except Exception as e:
+                log.error("%s failed to submit trail: %s — remaining %d UNPROTECTED, closing",
+                         sym, e, pos["remaining_qty"])
+                try:
+                    self.trading.submit_order(MarketOrderRequest(
+                        symbol=sym, qty=pos["remaining_qty"], side=exit_side,
+                        time_in_force=TimeInForce.DAY,
+                    ))
+                except Exception as e2:
+                    log.error("%s emergency close failed: %s", sym, e2)
 
         await _email(
             f"[Trader] TP1 {sym} {filled}@${price:.2f} +${tp_pnl:.2f}",
