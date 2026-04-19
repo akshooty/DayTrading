@@ -93,6 +93,8 @@ MEME_LEVERAGED_TICKERS = {
     "SOXL", "SOXS", "TSLL", "TSLZ", "MSTU", "MSTZ", "UVIX", "UVXY",
     "OPEN", "BBAI", "LCID", "PLUG",
     "SQQQ", "TQQQ", "SPXL", "SPXS", "FNGU", "FNGD", "NVDL", "NVDS",
+    # Leveraged commodity ETFs (ORB outsized losses)
+    "AGQ", "BOIL", "ETHU", "KOLD", "GUSH", "GASL",
 }
 BLOCKED_TICKERS = {
     s.strip().upper() for s in os.environ.get("BLOCKED_TICKERS", "RPAY").split(",") if s.strip()

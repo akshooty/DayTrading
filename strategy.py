@@ -616,6 +616,8 @@ class LevelToLevelLong:
     active_end_et: time = time(14, 0)
     touch_tolerance_pct: float = 0.003
     stop_buffer_pct: float = 0.002
+    vol_lookback: int = 20
+    vol_confirm_mult: float = 1.3   # require rejection bar volume >= 1.3x prior avg
     skip_first_n_bars: int = 30
 
     state: State = State.WATCHING
@@ -635,6 +637,13 @@ class LevelToLevelLong:
         if not levels:
             return None
 
+        # Rolling avg volume over prior N bars (excluding current bar).
+        vol_window = self.bars[-(self.vol_lookback + 1):-1]
+        avg_vol = (
+            sum(b.volume for b in vol_window) / max(len(vol_window), 1)
+            if vol_window else 0.0
+        )
+
         if self.state is State.WATCHING:
             for lvl in levels:
                 tol = lvl * self.touch_tolerance_pct
@@ -643,6 +652,9 @@ class LevelToLevelLong:
                     and bar.close > lvl
                     and bar.close < lvl * 1.01
                 ):
+                    # Volume confirmation: rejection needs conviction.
+                    if avg_vol > 0 and bar.volume < avg_vol * self.vol_confirm_mult:
+                        continue
                     higher = [l for l in levels if l > bar.close * 1.002]
                     if not higher:
                         continue
@@ -687,6 +699,8 @@ class LevelToLevelShort:
     active_end_et: time = time(14, 0)
     touch_tolerance_pct: float = 0.003
     stop_buffer_pct: float = 0.002
+    vol_lookback: int = 20
+    vol_confirm_mult: float = 1.3
     skip_first_n_bars: int = 30
 
     state: State = State.WATCHING
@@ -706,6 +720,12 @@ class LevelToLevelShort:
         if not levels:
             return None
 
+        vol_window = self.bars[-(self.vol_lookback + 1):-1]
+        avg_vol = (
+            sum(b.volume for b in vol_window) / max(len(vol_window), 1)
+            if vol_window else 0.0
+        )
+
         if self.state is State.WATCHING:
             for lvl in levels:
                 tol = lvl * self.touch_tolerance_pct
@@ -714,6 +734,8 @@ class LevelToLevelShort:
                     and bar.close < lvl
                     and bar.close > lvl * 0.99
                 ):
+                    if avg_vol > 0 and bar.volume < avg_vol * self.vol_confirm_mult:
+                        continue
                     lower = sorted((l for l in levels if l < bar.close * 0.998), reverse=True)
                     if not lower:
                         continue
@@ -1085,6 +1107,7 @@ class CatalystLong:
     stop_buffer_pct: float = 0.002
     relax_factor: float = 0.75
     skip_first_n_bars: int = 30
+    entry_end_et: time = time(15, 0)  # no new entries after 15:00 ET (EOD cutoff)
 
     state: State = State.WATCHING
     bars: list[Bar] = field(default_factory=list)
@@ -1099,6 +1122,10 @@ class CatalystLong:
         if len(self.bars) <= max(self.skip_first_n_bars, self.vol_lookback + 1):
             return None
 
+        # EOD cutoff: still let ARMED stops fire, but no new arms.
+        et = bar.timestamp.astimezone(_EASTERN).time()
+        eod_block = et >= self.entry_end_et
+
         vol_window = self.bars[-(self.vol_lookback + 1):-1]
         avg_vol = sum(b.volume for b in vol_window) / max(len(vol_window), 1)
         if avg_vol <= 0:
@@ -1112,7 +1139,7 @@ class CatalystLong:
         spike = bar.volume >= threshold * avg_vol
 
         if self.state is State.WATCHING:
-            if not spike:
+            if eod_block or not spike:
                 return None
             range_window = self.bars[-(self.range_lookback + 1):-1]
             prior_high = max(b.high for b in range_window)
@@ -1162,6 +1189,7 @@ class CatalystShort:
     stop_buffer_pct: float = 0.002
     relax_factor: float = 0.75
     skip_first_n_bars: int = 30
+    entry_end_et: time = time(15, 0)  # EOD cutoff
 
     state: State = State.WATCHING
     bars: list[Bar] = field(default_factory=list)
@@ -1176,6 +1204,9 @@ class CatalystShort:
         if len(self.bars) <= max(self.skip_first_n_bars, self.vol_lookback + 1):
             return None
 
+        et = bar.timestamp.astimezone(_EASTERN).time()
+        eod_block = et >= self.entry_end_et
+
         vol_window = self.bars[-(self.vol_lookback + 1):-1]
         avg_vol = sum(b.volume for b in vol_window) / max(len(vol_window), 1)
         if avg_vol <= 0:
@@ -1189,7 +1220,7 @@ class CatalystShort:
         spike = bar.volume >= threshold * avg_vol
 
         if self.state is State.WATCHING:
-            if not spike:
+            if eod_block or not spike:
                 return None
             range_window = self.bars[-(self.range_lookback + 1):-1]
             prior_high = max(b.high for b in range_window)
@@ -1226,6 +1257,8 @@ class CatalystShort:
 
     def on_exit_filled(self) -> None:
         self.state = State.CLOSED
+
+
 
 
 

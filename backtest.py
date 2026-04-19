@@ -85,6 +85,10 @@ MEME_LEVERAGED_TICKERS = {
     "SOXL", "SOXS", "TSLL", "TSLZ", "MSTU", "MSTZ", "UVIX", "UVXY",
     "OPEN", "BBAI", "LCID", "PLUG",
     "SQQQ", "TQQQ", "SPXL", "SPXS", "FNGU", "FNGD", "NVDL", "NVDS",
+    # Leveraged commodity ETFs — ORB took outsized losses on these
+    # (AGQ Ultra Silver, BOIL Ultra NatGas, ETHU 2x Ether, KOLD Ultra
+    # Short NatGas, GUSH Bull 2x O&G, GASL Bull 3x NatGas)
+    "AGQ", "BOIL", "ETHU", "KOLD", "GUSH", "GASL",
 }
 BLOCKED_TICKERS = {s.strip().upper() for s in os.environ.get("BLOCKED_TICKERS", "RPAY").split(",") if s.strip()}
 # 9:30-10:00 block disabled by default: catalyst-driven breakouts on this
@@ -194,8 +198,11 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         end_et = now_et
 
     feed = DataFeed[os.environ.get("FEED", "IEX").upper()]
+    # Always include SPY in the minute-bar fetch so SectorRotation states
+    # can gate on a flat-index condition.
+    minute_symbols = list({*watchlist.keys(), "SPY"})
     req = StockBarsRequest(
-        symbol_or_symbols=list(watchlist.keys()),
+        symbol_or_symbols=minute_symbols,
         timeframe=TimeFrame.Minute,
         start=start_et,
         end=end_et,
@@ -283,7 +290,25 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
     circuit_broken = False
     realized_pnl = 0.0
 
+    # Cache references to all SectorRotation instances for fast SPY-flag updates.
+    from strategy import SectorRotationLong as _SecLong, SectorRotationShort as _SecShort
+    _sector_states = [
+        st for sts_list in states.values() for st in sts_list
+        if isinstance(st, (_SecLong, _SecShort))
+    ]
+    _spy_open: float | None = None
+
     for ts, ticker, b in events:
+        # SPY pseudo-event: update intraday move % on SectorRotation states,
+        # then continue (SPY isn't in the per-ticker `states` dict).
+        if ticker == "SPY":
+            if _spy_open is None:
+                _spy_open = b.open
+            if _spy_open and _spy_open > 0:
+                move_pct = (b.close - _spy_open) / _spy_open
+                for st in _sector_states:
+                    st.index_move_pct = move_pct
+            continue
         sts = states.get(ticker)
         if not sts:
             continue
@@ -503,21 +528,22 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                 )
                 tag = pos.get("_tag") or ""
                 if tag == "runner":
-                    # Midpoint trail: stop ratchets to halfway between the
-                    # current favorable extreme and the entry. As price
-                    # extends further, the stop tightens toward the
-                    # 50%-retrace line — never below breakeven (since
-                    # breakeven == entry == midpoint when extreme==entry).
+                    # Tight trail: stop ratchets to 75% of the way from
+                    # entry to the favorable extreme (i.e. only the last
+                    # 25% of the extension can be given back). Tighter
+                    # than the prior 50% midpoint — fewer winners flip
+                    # to losers in Phase 2.
+                    trail_frac = 0.75
                     if d is Direction.LONG:
                         if b.high > pos["extreme"]:
                             pos["extreme"] = b.high
-                        midpoint = (pos["extreme"] + pos["entry"]) / 2
-                        pos["stop"] = max(pos["stop"], midpoint)
+                        target_stop = pos["entry"] + trail_frac * (pos["extreme"] - pos["entry"])
+                        pos["stop"] = max(pos["stop"], target_stop)
                     else:
                         if b.low < pos["extreme"]:
                             pos["extreme"] = b.low
-                        midpoint = (pos["extreme"] + pos["entry"]) / 2
-                        pos["stop"] = min(pos["stop"], midpoint)
+                        target_stop = pos["entry"] + trail_frac * (pos["extreme"] - pos["entry"])
+                        pos["stop"] = min(pos["stop"], target_stop)
                 elif use_ma9:
                     ema9 = ma9_5m.get(ticker, {}).get("ema")
                     if ema9 is not None:
