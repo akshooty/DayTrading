@@ -35,9 +35,19 @@ from strategy import (
     Bar as IntBar,
     BreakoutLongState,
     BreakoutShortState,
+    CatalystLong,
+    CatalystShort,
     Direction,
+    LevelToLevelLong,
+    LevelToLevelShort,
     ORBState,
     ResetSignal,
+    RunnerLong,
+    RunnerShort,
+    SectorRotationLong,
+    SectorRotationShort,
+    VWAPSnapbackLong,
+    VWAPSnapbackShort,
     min_stop_dist,
     position_size,
 )
@@ -103,6 +113,7 @@ class Trade:
     closed_at: datetime
     status: str  # 'closed_with_tp' | 'closed_no_tp' | 'open_eod'
     strategy: str = ""
+    planned_rr: float = 0.0  # (target-distance) / (risk-distance) at arm time
 
 
 def _valid(sym: str) -> bool:
@@ -234,8 +245,29 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
     # First one to ARM wins the ticker's position slot.
     states: dict[str, list] = {}
     for sym, d in watchlist.items():
-        primary = BreakoutLongState(sym) if d is Direction.LONG else BreakoutShortState(sym)
-        states[sym] = [primary, ORBState(sym)]
+        if d is Direction.LONG:
+            states[sym] = [
+                BreakoutLongState(sym), ORBState(sym), RunnerLong(sym),
+                LevelToLevelLong(sym),
+                SectorRotationLong(sym),
+                VWAPSnapbackLong(sym),
+                CatalystLong(sym),
+            ]
+        else:
+            states[sym] = [
+                BreakoutShortState(sym), ORBState(sym), RunnerShort(sym),
+                LevelToLevelShort(sym),
+                SectorRotationShort(sym),
+                VWAPSnapbackShort(sym),
+                CatalystShort(sym),
+            ]
+    # Propagate the SPY-gap regime flag to Catalyst state machines so
+    # they relax their volume threshold on news/gap days.
+    if regime_reduced:
+        for per in states.values():
+            for st in per:
+                if isinstance(st, (CatalystLong, CatalystShort)):
+                    st.sky_gap_active = True
 
     positions: dict[str, dict] = {}
     pending: dict[str, tuple[ArmSignal, object]] = {}
@@ -297,6 +329,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     opened_at=pos["opened_at"], closed_at=ts,
                     status="closed_no_tp",
                     strategy=pos.get("strategy", ""),
+                    planned_rr=pos.get("_planned_rr", 0.0),
                 ))
                 owner = pos.get("owner")
                 if owner is not None:
@@ -310,7 +343,11 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         if ticker in pending:
             sig, armed_state = pending[ticker]
             filled = False
-            if sig.direction is Direction.LONG and b.high >= sig.entry:
+            if sig.tag in ("l2l", "sector", "vwap_snap", "catalyst"):
+                # Market-on-next-bar fill (entry = bar.close of prior bar).
+                fill = b.open
+                filled = True
+            elif sig.direction is Direction.LONG and b.high >= sig.entry:
                 fill = max(sig.entry, b.open)
                 filled = True
             elif sig.direction is Direction.SHORT and b.low <= sig.entry:
@@ -335,7 +372,9 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     hybrid_tp_pct = float(os.environ.get("HYBRID_TP_PCT", 4))
                     hybrid_atr_period = int(os.environ.get("HYBRID_ATR_PERIOD", 14))
                     if hybrid_mode:
-                        if sig.direction is Direction.LONG:
+                        if sig.target is not None:
+                            tp_level = sig.target
+                        elif sig.direction is Direction.LONG:
                             tp_level = fill * (1 + hybrid_tp_pct / 100)
                         else:
                             tp_level = fill * (1 - hybrid_tp_pct / 100)
@@ -363,6 +402,11 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                         strategy=type(armed_state).__name__,
                         _atr_at_entry=atr_at_entry,
                         _hybrid_mode=hybrid_mode,
+                        _tag=sig.tag,
+                        _planned_rr=(
+                            abs(tp_level - fill) / max(abs(fill - sig.stop), 1e-9)
+                            if hybrid_mode else 1.0
+                        ),
                     )
                     armed_state.on_entry_filled()
                 del pending[ticker]
@@ -418,6 +462,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                         opened_at=pos["opened_at"], closed_at=ts,
                         status="closed_with_tp" if hit_hard else "closed_no_tp",
                         strategy=pos.get("strategy", ""),
+                    planned_rr=pos.get("_planned_rr", 0.0),
                     ))
                     owner = pos.get("owner")
                     if owner is not None:
@@ -456,7 +501,24 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     pos.get("_hybrid_mode")
                     and os.environ.get("EXIT_MA9_5M", "").lower() in ("1", "true", "yes")
                 )
-                if use_ma9:
+                tag = pos.get("_tag") or ""
+                if tag == "runner":
+                    # Midpoint trail: stop ratchets to halfway between the
+                    # current favorable extreme and the entry. As price
+                    # extends further, the stop tightens toward the
+                    # 50%-retrace line — never below breakeven (since
+                    # breakeven == entry == midpoint when extreme==entry).
+                    if d is Direction.LONG:
+                        if b.high > pos["extreme"]:
+                            pos["extreme"] = b.high
+                        midpoint = (pos["extreme"] + pos["entry"]) / 2
+                        pos["stop"] = max(pos["stop"], midpoint)
+                    else:
+                        if b.low < pos["extreme"]:
+                            pos["extreme"] = b.low
+                        midpoint = (pos["extreme"] + pos["entry"]) / 2
+                        pos["stop"] = min(pos["stop"], midpoint)
+                elif use_ma9:
                     ema9 = ma9_5m.get(ticker, {}).get("ema")
                     if ema9 is not None:
                         if d is Direction.LONG and b.close < ema9:
@@ -508,6 +570,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     opened_at=pos["opened_at"], closed_at=ts,
                     status=status,
                     strategy=pos.get("strategy", ""),
+                    planned_rr=pos.get("_planned_rr", 0.0),
                 ))
                 owner = pos.get("owner")
                 if owner is not None:
@@ -539,7 +602,9 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     skipped_opening += 1
                     st.reset_to_watching()
                     continue
-                if _in_chop(ts):
+                # Mid-day fade strategies (l2l, sweep, sector) are DESIGNED
+                # for the chop window — don't skip them there.
+                if _in_chop(ts) and sig.tag not in ("l2l", "sector", "vwap_snap", "catalyst"):
                     skipped_chop += 1
                     st.reset_to_watching()
                     continue
@@ -590,6 +655,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
             opened_at=pos["opened_at"], closed_at=end_et,
             status="open_eod",
             strategy=pos.get("strategy", ""),
+                    planned_rr=pos.get("_planned_rr", 0.0),
         ))
 
     # Report
