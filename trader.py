@@ -396,7 +396,7 @@ class BreakoutTrader:
             sym, oid,
         )
         await _email(
-            f"[Trader] CANCEL UNCONFIRMED {sym}",
+            f"[Algo] {sym}: CANCEL UNCONFIRMED",
             (
                 f"Symbol: {sym}\n"
                 f"Order:  {oid}\n"
@@ -579,7 +579,7 @@ class BreakoutTrader:
             return
 
         await _email(
-            f"[Trader] ENTRY {sym} {st.direction.value.upper()} {filled}@${price:.2f}",
+            f"[Algo] {sym}: ENTRY {filled}@${price:.2f} = ${filled * price:,.2f}",
             (
                 f"Symbol:     {sym}\n"
                 f"Direction:  {st.direction.value}\n"
@@ -685,7 +685,7 @@ class BreakoutTrader:
                     log.error("%s emergency close failed: %s", sym, e2)
 
         await _email(
-            f"[Trader] TP1 {sym} {filled}@${price:.2f} +${tp_pnl:.2f}",
+            f"[Algo] {sym}: TP1 ${tp_pnl:+,.2f}",
             (
                 f"Symbol:     {sym}\n"
                 f"Direction:  {d.value}\n"
@@ -785,7 +785,7 @@ class BreakoutTrader:
         lines.append(f"Locked out:  {sym in self.locked_out}")
         lines.append(f"Time:        {datetime.now(EASTERN).isoformat()}")
         await _email(
-            f"[Trader] EXIT {sym} {sign} ${total_trade_pnl:+.2f}",
+            f"[Algo] {sym}: ${total_trade_pnl:+,.2f}",
             "\n".join(lines) + "\n",
         )
 
