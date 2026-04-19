@@ -604,6 +604,8 @@ class BreakoutTrader:
             else (pos["entry"] - price) * filled
         )
         pos["tp_pnl"] += tp_pnl
+        pos["tp_fill_price"] = price
+        pos["tp_fill_qty"] = (pos.get("tp_fill_qty", 0) or 0) + filled
         pos["remaining_qty"] -= filled
         pos["phase"] = 2
         pos["tp_order_id"] = None
@@ -743,21 +745,48 @@ class BreakoutTrader:
         self.positions.pop(sym, None)
 
         sign = "WIN" if total_trade_pnl >= 0 else "LOSS"
+        is_long = d is Direction.LONG
+        entry_price = pos["entry"]
+        original_qty = pos.get("original_qty", filled)
+        tp1_qty = pos.get("tp_fill_qty", 0) or 0
+        tp1_price = pos.get("tp_fill_price")
+        tp_pnl = pos.get("tp_pnl", 0.0)
+        phase_label = "stop" if pos.get("phase") == 1 else "trail"
+        entry_notional = original_qty * entry_price
+        exit_pct = (
+            (price / entry_price - 1) * 100 if is_long
+            else (1 - price / entry_price) * 100
+        ) if entry_price else 0.0
+
+        lines = [
+            f"Symbol:      {sym}",
+            f"Direction:   {d.value}",
+            f"Phase:       {pos.get('phase', 0)} ({phase_label})",
+            "",
+            f"Entry:       {original_qty} @ ${entry_price:.2f}  =  ${entry_notional:,.2f} deployed",
+        ]
+        if tp1_qty > 0 and tp1_price:
+            tp1_pct = (
+                (tp1_price / entry_price - 1) * 100 if is_long
+                else (1 - tp1_price / entry_price) * 100
+            ) if entry_price else 0.0
+            lines.append(
+                f"TP1 exit:    {tp1_qty} @ ${tp1_price:.2f}  =  ${tp_pnl:+,.2f}  ({tp1_pct:+.2f}%)"
+            )
+        else:
+            lines.append(f"TP1 exit:    -  (not hit)")
+        lines.append(
+            f"Final exit:  {filled} @ ${price:.2f}  =  ${exit_pnl:+,.2f}  ({exit_pct:+.2f}%, {phase_label})"
+        )
+        lines.append("-" * 54)
+        lines.append(f"Trade P&L:   ${total_trade_pnl:+,.2f}  ({sign})")
+        lines.append("")
+        lines.append(f"Day P&L:     ${self.realized_pnl:+,.2f}")
+        lines.append(f"Locked out:  {sym in self.locked_out}")
+        lines.append(f"Time:        {datetime.now(EASTERN).isoformat()}")
         await _email(
             f"[Trader] EXIT {sym} {sign} ${total_trade_pnl:+.2f}",
-            (
-                f"Symbol:     {sym}\n"
-                f"Direction:  {d.value}\n"
-                f"Phase:      {pos.get('phase', 0)} ({'stop' if pos.get('phase') == 1 else 'trail'})\n"
-                f"Entry:      ${pos['entry']:.2f}\n"
-                f"Final exit: {filled} @ ${price:.2f}\n"
-                f"TP1 P&L:    ${pos.get('tp_pnl', 0.0):+,.2f}\n"
-                f"Final P&L:  ${exit_pnl:+,.2f}\n"
-                f"Trade P&L:  ${total_trade_pnl:+,.2f}\n"
-                f"Day P&L:    ${self.realized_pnl:+,.2f}\n"
-                f"Locked out: {sym in self.locked_out}\n"
-                f"Time:       {datetime.now(EASTERN).isoformat()}\n"
-            ),
+            "\n".join(lines) + "\n",
         )
 
     async def eod_closeout(self) -> None:
