@@ -151,10 +151,6 @@ class BreakoutTrader:
         self.entry_orders: dict[str, str] = {}
         self.positions: dict[str, dict] = {}
         self.locked_out: set[str] = set()
-        # Tickers whose entry order was already submitted today (any outcome:
-        # filled, cancelled, expired). One shot per ticker per day — prevents
-        # unfilled entries from re-arming after the state machine resets.
-        self.used_setups: set[str] = set()
         self.equity: float = 0.0
         self.realized_pnl: float = 0.0
         self.circuit_broken: bool = False
@@ -248,8 +244,17 @@ class BreakoutTrader:
             log.info("%s ARM skipped (blocked ticker)", s.symbol)
             self.states[s.symbol].reset_to_watching()
             return
-        if s.symbol in self.used_setups:
-            log.info("%s ARM skipped (entry already placed today — one shot per ticker)", s.symbol)
+        # Don't double up: if the ticker has a pending entry order or an
+        # open position, skip this new arm. A prior entry that was
+        # cancelled will have been popped from entry_orders by the
+        # trade-update handler once Alpaca confirmed terminal status,
+        # so this check allows legitimate re-entries on fresh setups.
+        if s.symbol in self.entry_orders:
+            log.info("%s ARM skipped (entry order already pending)", s.symbol)
+            self.states[s.symbol].reset_to_watching()
+            return
+        if s.symbol in self.positions:
+            log.info("%s ARM skipped (position already open)", s.symbol)
             self.states[s.symbol].reset_to_watching()
             return
         if self._in_chop_now():
@@ -322,10 +327,6 @@ class BreakoutTrader:
 
         order = self.trading.submit_order(req)
         self.entry_orders[s.symbol] = str(order.id)
-        # Mark this ticker as spent for the day. Any subsequent state-
-        # machine arm for this symbol is dropped by _handle_arm even if
-        # this entry gets cancelled or expires unfilled.
-        self.used_setups.add(s.symbol)
 
     def _confirm_order(self, order_id: str):
         """Re-query Alpaca for the authoritative order state.
