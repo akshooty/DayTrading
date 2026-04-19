@@ -50,6 +50,10 @@ class ArmSignal:
     stop: float   # initial stop (pullback low for long, bounce high for short)
     target: Optional[float] = None  # absolute TP price; overrides HYBRID_TP_PCT
     tag: str = ""  # routing tag, e.g. "runner" / "spike" — controls Phase 2 trail
+    # Populated by backtest at arm time via compute_signal_score() below.
+    # Used by the top-quartile signal-quality filter when enabled.
+    score: float = 0.0
+    score_components: Optional[dict] = None
 
 
 @dataclass
@@ -354,7 +358,7 @@ class RunnerLong:
     symbol: str
     move_threshold: float = 0.05
     ema_period: int = 9
-    cons_bars_required: int = 3
+    cons_bars_required: int = 5
     cons_proximity_pct: float = 0.01
     cons_tight_atr_mult: float = 0.6
     rr_target: float = 1.6
@@ -466,7 +470,7 @@ class RunnerShort:
     symbol: str
     move_threshold: float = 0.05
     ema_period: int = 9
-    cons_bars_required: int = 3
+    cons_bars_required: int = 5
     cons_proximity_pct: float = 0.01
     cons_tight_atr_mult: float = 0.6
     rr_target: float = 1.6
@@ -564,362 +568,9 @@ class RunnerShort:
 
 
 
-def _l2l_levels(bars: list[Bar], or_bars: int, current_price: float) -> list[float]:
-    """Compute key levels dynamically: session open, intraday H/L,
-    opening-range H/L (first or_bars bars), and round-dollar numbers
-    within +/- 5% of current price. Returned sorted ascending.
-    """
-    if not bars:
-        return []
-    levels = set()
-    levels.add(round(bars[0].open, 4))
-    levels.add(round(max(b.high for b in bars), 4))
-    levels.add(round(min(b.low for b in bars), 4))
-    if len(bars) >= or_bars:
-        or_window = bars[:or_bars]
-        levels.add(round(max(b.high for b in or_window), 4))
-        levels.add(round(min(b.low for b in or_window), 4))
-    band_lo = current_price * 0.95
-    band_hi = current_price * 1.05
-    if current_price >= 100:
-        step = 1.0
-    elif current_price >= 10:
-        step = 0.5
-    elif current_price >= 1:
-        step = 0.10
-    else:
-        step = 0.05
-    n = int(band_lo / step)
-    while n * step <= band_hi:
-        if n * step >= band_lo:
-            levels.add(round(n * step, 4))
-        n += 1
-    return sorted(levels)
-
-
-@dataclass
-class LevelToLevelLong:
-    """Mid-day level-to-level scalp LONG. Active only during chop window
-    (default 11:30-14:00 ET). Levels computed dynamically each bar:
-    session open, opening-range H/L, intraday H/L, round-dollar numbers
-    within +/- 5% of current price.
-
-    Setup: bar.low touches/penetrates a level from above AND bar.close > level
-    (rejection — buyers defended).
-    Entry: bar.close (market on next bar's open).
-    Stop:  rejection bar's low minus small buffer.
-    Target: next level above current price.
-    """
-    symbol: str
-    or_bars: int = 30
-    active_start_et: time = time(11, 30)
-    active_end_et: time = time(14, 0)
-    touch_tolerance_pct: float = 0.003
-    stop_buffer_pct: float = 0.002
-    vol_lookback: int = 20
-    vol_confirm_mult: float = 1.3   # require rejection bar volume >= 1.3x prior avg
-    skip_first_n_bars: int = 30
-
-    state: State = State.WATCHING
-    bars: list[Bar] = field(default_factory=list)
-    pending_entry: float = 0.0
-    pending_stop: float = 0.0
-    direction: Direction = Direction.LONG
-
-    def on_bar(self, bar: Bar) -> Optional[Signal]:
-        self.bars.append(bar)
-        if len(self.bars) <= self.skip_first_n_bars:
-            return None
-        et = bar.timestamp.astimezone(_EASTERN).time()
-        if not (self.active_start_et <= et < self.active_end_et):
-            return None
-        levels = _l2l_levels(self.bars, self.or_bars, bar.close)
-        if not levels:
-            return None
-
-        # Rolling avg volume over prior N bars (excluding current bar).
-        vol_window = self.bars[-(self.vol_lookback + 1):-1]
-        avg_vol = (
-            sum(b.volume for b in vol_window) / max(len(vol_window), 1)
-            if vol_window else 0.0
-        )
-
-        if self.state is State.WATCHING:
-            for lvl in levels:
-                tol = lvl * self.touch_tolerance_pct
-                if (
-                    bar.low <= lvl + tol
-                    and bar.close > lvl
-                    and bar.close < lvl * 1.01
-                ):
-                    # Volume confirmation: rejection needs conviction.
-                    if avg_vol > 0 and bar.volume < avg_vol * self.vol_confirm_mult:
-                        continue
-                    higher = [l for l in levels if l > bar.close * 1.002]
-                    if not higher:
-                        continue
-                    target = higher[0]
-                    entry = bar.close
-                    stop = bar.low * (1 - self.stop_buffer_pct)
-                    if target - entry <= 0 or entry - stop <= 0:
-                        continue
-                    self.pending_entry = entry
-                    self.pending_stop = stop
-                    self.state = State.ARMED
-                    return ArmSignal(
-                        self.symbol, Direction.LONG,
-                        entry=entry, stop=stop,
-                        target=target, tag="l2l",
-                    )
-            return None
-
-        if self.state is State.ARMED:
-            if bar.low < self.pending_stop:
-                self.reset_to_watching()
-                return ResetSignal(self.symbol, Direction.LONG)
-            return None
-        return None
-
-    def reset_to_watching(self) -> None:
-        self.state = State.WATCHING
-
-    def on_entry_filled(self) -> None:
-        self.state = State.IN_POSITION
-
-    def on_exit_filled(self) -> None:
-        self.state = State.CLOSED
-
-
-@dataclass
-class LevelToLevelShort:
-    """Mirror of LevelToLevelLong."""
-    symbol: str
-    or_bars: int = 30
-    active_start_et: time = time(11, 30)
-    active_end_et: time = time(14, 0)
-    touch_tolerance_pct: float = 0.003
-    stop_buffer_pct: float = 0.002
-    vol_lookback: int = 20
-    vol_confirm_mult: float = 1.3
-    skip_first_n_bars: int = 30
-
-    state: State = State.WATCHING
-    bars: list[Bar] = field(default_factory=list)
-    pending_entry: float = 0.0
-    pending_stop: float = 0.0
-    direction: Direction = Direction.SHORT
-
-    def on_bar(self, bar: Bar) -> Optional[Signal]:
-        self.bars.append(bar)
-        if len(self.bars) <= self.skip_first_n_bars:
-            return None
-        et = bar.timestamp.astimezone(_EASTERN).time()
-        if not (self.active_start_et <= et < self.active_end_et):
-            return None
-        levels = _l2l_levels(self.bars, self.or_bars, bar.close)
-        if not levels:
-            return None
-
-        vol_window = self.bars[-(self.vol_lookback + 1):-1]
-        avg_vol = (
-            sum(b.volume for b in vol_window) / max(len(vol_window), 1)
-            if vol_window else 0.0
-        )
-
-        if self.state is State.WATCHING:
-            for lvl in levels:
-                tol = lvl * self.touch_tolerance_pct
-                if (
-                    bar.high >= lvl - tol
-                    and bar.close < lvl
-                    and bar.close > lvl * 0.99
-                ):
-                    if avg_vol > 0 and bar.volume < avg_vol * self.vol_confirm_mult:
-                        continue
-                    lower = sorted((l for l in levels if l < bar.close * 0.998), reverse=True)
-                    if not lower:
-                        continue
-                    target = lower[0]
-                    entry = bar.close
-                    stop = bar.high * (1 + self.stop_buffer_pct)
-                    if entry - target <= 0 or stop - entry <= 0:
-                        continue
-                    self.pending_entry = entry
-                    self.pending_stop = stop
-                    self.state = State.ARMED
-                    return ArmSignal(
-                        self.symbol, Direction.SHORT,
-                        entry=entry, stop=stop,
-                        target=target, tag="l2l",
-                    )
-            return None
-
-        if self.state is State.ARMED:
-            if bar.high > self.pending_stop:
-                self.reset_to_watching()
-                return ResetSignal(self.symbol, Direction.SHORT)
-            return None
-        return None
-
-    def reset_to_watching(self) -> None:
-        self.state = State.WATCHING
-
-    def on_entry_filled(self) -> None:
-        self.state = State.IN_POSITION
-
-    def on_exit_filled(self) -> None:
-        self.state = State.CLOSED
 
 
 
-
-@dataclass
-class SectorRotationLong:
-    """Mid-day relative-strength continuation LONG. Active in chop window
-    (default 11:30-14:00 ET). Triggers when the ticker prints a new HOD
-    while the broad index is flat (|SPY intraday move| < flat_pct).
-
-    SPY intraday move is read from the `index_move_pct` attribute, which
-    the runtime updates each bar. If the runtime never updates it, the
-    SPY-flat gate is skipped (falls back to 'new HOD in chop' only).
-
-    Setup: bar.high > prior intraday HOD AND |index_move_pct| < flat_pct
-    Entry: bar.close (market next bar)
-    Stop:  bar.low - small buffer
-    Target: entry + rr_target * risk
-    """
-    symbol: str
-    flat_pct: float = 0.003          # SPY |move| < 0.3% counts as flat
-    rr_target: float = 2.0
-    active_start_et: time = time(11, 30)
-    active_end_et: time = time(14, 0)
-    stop_buffer_pct: float = 0.002
-    skip_first_n_bars: int = 30
-
-    state: State = State.WATCHING
-    bars: list[Bar] = field(default_factory=list)
-    intraday_high: float = 0.0
-    pending_entry: float = 0.0
-    pending_stop: float = 0.0
-    index_move_pct: Optional[float] = None  # set externally per bar
-
-    direction: Direction = Direction.LONG
-
-    def on_bar(self, bar: Bar) -> Optional[Signal]:
-        prior_hod = self.intraday_high
-        self.bars.append(bar)
-        if bar.high > self.intraday_high:
-            self.intraday_high = bar.high
-        if len(self.bars) <= self.skip_first_n_bars:
-            return None
-        et = bar.timestamp.astimezone(_EASTERN).time()
-        if not (self.active_start_et <= et < self.active_end_et):
-            return None
-
-        if self.state is State.WATCHING:
-            if bar.high <= prior_hod:
-                return None
-            # SPY-flat gate (only enforced when index_move_pct is provided).
-            if self.index_move_pct is not None and abs(self.index_move_pct) > self.flat_pct:
-                return None
-            entry = bar.close
-            stop = bar.low * (1 - self.stop_buffer_pct)
-            risk = entry - stop
-            if risk <= 0:
-                return None
-            target = entry + self.rr_target * risk
-            self.pending_entry = entry
-            self.pending_stop = stop
-            self.state = State.ARMED
-            return ArmSignal(
-                self.symbol, Direction.LONG,
-                entry=entry, stop=stop,
-                target=target, tag="sector",
-            )
-
-        if self.state is State.ARMED:
-            if bar.low < self.pending_stop:
-                self.reset_to_watching()
-                return ResetSignal(self.symbol, Direction.LONG)
-            return None
-        return None
-
-    def reset_to_watching(self) -> None:
-        self.state = State.WATCHING
-
-    def on_entry_filled(self) -> None:
-        self.state = State.IN_POSITION
-
-    def on_exit_filled(self) -> None:
-        self.state = State.CLOSED
-
-
-@dataclass
-class SectorRotationShort:
-    """Mirror of SectorRotationLong: new intraday LOW with SPY flat = fade short."""
-    symbol: str
-    flat_pct: float = 0.003
-    rr_target: float = 2.0
-    active_start_et: time = time(11, 30)
-    active_end_et: time = time(14, 0)
-    stop_buffer_pct: float = 0.002
-    skip_first_n_bars: int = 30
-
-    state: State = State.WATCHING
-    bars: list[Bar] = field(default_factory=list)
-    intraday_low: float = float("inf")
-    pending_entry: float = 0.0
-    pending_stop: float = 0.0
-    index_move_pct: Optional[float] = None
-
-    direction: Direction = Direction.SHORT
-
-    def on_bar(self, bar: Bar) -> Optional[Signal]:
-        prior_lod = self.intraday_low
-        self.bars.append(bar)
-        if bar.low < self.intraday_low:
-            self.intraday_low = bar.low
-        if len(self.bars) <= self.skip_first_n_bars:
-            return None
-        et = bar.timestamp.astimezone(_EASTERN).time()
-        if not (self.active_start_et <= et < self.active_end_et):
-            return None
-
-        if self.state is State.WATCHING:
-            if bar.low >= prior_lod:
-                return None
-            if self.index_move_pct is not None and abs(self.index_move_pct) > self.flat_pct:
-                return None
-            entry = bar.close
-            stop = bar.high * (1 + self.stop_buffer_pct)
-            risk = stop - entry
-            if risk <= 0:
-                return None
-            target = entry - self.rr_target * risk
-            self.pending_entry = entry
-            self.pending_stop = stop
-            self.state = State.ARMED
-            return ArmSignal(
-                self.symbol, Direction.SHORT,
-                entry=entry, stop=stop,
-                target=target, tag="sector",
-            )
-
-        if self.state is State.ARMED:
-            if bar.high > self.pending_stop:
-                self.reset_to_watching()
-                return ResetSignal(self.symbol, Direction.SHORT)
-            return None
-        return None
-
-    def reset_to_watching(self) -> None:
-        self.state = State.WATCHING
-
-    def on_entry_filled(self) -> None:
-        self.state = State.IN_POSITION
-
-    def on_exit_filled(self) -> None:
-        self.state = State.CLOSED
 
 
 @dataclass
@@ -1100,7 +751,7 @@ class CatalystLong:
     Target: entry + rr_target * risk.
     """
     symbol: str
-    vol_spike_mult: float = 3.0
+    vol_spike_mult: float = 4.0
     vol_lookback: int = 30
     range_lookback: int = 10
     rr_target: float = 2.0
@@ -1182,7 +833,7 @@ class CatalystLong:
 class CatalystShort:
     """Mirror of CatalystLong: volume spike + break DOWN of recent range."""
     symbol: str
-    vol_spike_mult: float = 3.0
+    vol_spike_mult: float = 4.0
     vol_lookback: int = 30
     range_lookback: int = 10
     rr_target: float = 2.0
@@ -1265,8 +916,6 @@ class CatalystShort:
 BreakoutState = Union[
     BreakoutLongState, BreakoutShortState, ORBState,
     RunnerLong, RunnerShort,
-    LevelToLevelLong, LevelToLevelShort,
-    SectorRotationLong, SectorRotationShort,
     VWAPSnapbackLong, VWAPSnapbackShort,
     CatalystLong, CatalystShort,
 ]
@@ -1300,3 +949,109 @@ def position_size(
     qty_from_risk = max_risk / stop_dist
     qty_from_cap = max_deployment / entry if entry > 0 else 0.0
     return max(int(min(qty_from_risk, qty_from_cap)), 0)
+
+
+# ---------------------------------------------------------------------------
+# Signal-quality scoring (change #1: top-quartile filter)
+# ---------------------------------------------------------------------------
+#
+# Composite score combining features computable from the strategy's own bar
+# history at arm time. NO look-ahead: only bars up to and including the arm
+# bar are used. Higher = higher conviction.
+#
+# Features:
+#   relvol      — arm-bar volume / mean volume over the prior 20 bars.
+#                 Strong relvol = institutional interest, cleaner breakout.
+#   push        — distance price extended beyond the trigger level on the arm
+#                 bar, normalized by ATR(14). Bigger push = stronger momentum.
+#   atr_expand  — recent ATR(14) vs. ATR(14) from 15 bars earlier.
+#                 >1 = volatility expanding (fresh move), <1 = compressing.
+#   intraday    — arm-bar move vs. session open, normalized by session ATR.
+#                 Proxy for "catalyst strength / price action" — big daily
+#                 movers score high.
+#   gap         — session open vs. yesterday's close. Not computable from
+#                 intraday bars alone (prior-day close not in state). When a
+#                 prior-close reference is unavailable, returns 0 and is
+#                 noted in score_components.
+#
+# Float isn't computable from bar data; a proper implementation needs an
+# external float/shares-outstanding data source (left as TODO).
+#
+# The backtest's two-pass mode (COLLECT_SIGNALS_ONLY then MIN_SIGNAL_SCORE)
+# computes the 75th-percentile threshold from pass 1 and applies it in pass 2.
+# ---------------------------------------------------------------------------
+
+def _tr(bar, prev_close):
+    return max(bar.high - bar.low, abs(bar.high - prev_close), abs(bar.low - prev_close))
+
+
+def _atr(bars, period):
+    if len(bars) < period + 1:
+        return 0.0
+    recent = bars[-(period + 1):]
+    trs = [_tr(recent[i], recent[i - 1].close) for i in range(1, len(recent))]
+    return sum(trs) / period
+
+
+def compute_signal_score(
+    bars: list,
+    direction: "Direction",
+    entry: float,
+    stop: float,
+    prior_day_close: Optional[float] = None,
+) -> tuple[float, dict]:
+    """Return (composite_score, components_dict).
+
+    `bars` should be the strategy's bar history including the arm bar.
+    """
+    comp: dict = {"relvol": 0.0, "push": 0.0, "atr_expand": 0.0,
+                  "intraday": 0.0, "gap": 0.0, "float": None}
+    if not bars:
+        return 0.0, comp
+    arm_bar = bars[-1]
+
+    # relvol: arm-bar volume vs prior-20 mean
+    prior = bars[-21:-1] if len(bars) >= 21 else bars[:-1]
+    if prior:
+        mean_vol = sum(b.volume for b in prior) / len(prior)
+        if mean_vol > 0:
+            comp["relvol"] = arm_bar.volume / mean_vol
+
+    # push: how far past trigger did this bar go, normalized by ATR(14)
+    atr14 = _atr(bars, 14)
+    if atr14 > 0:
+        if direction.value == "long":
+            push_abs = max(0.0, arm_bar.high - entry)
+        else:
+            push_abs = max(0.0, entry - arm_bar.low)
+        comp["push"] = push_abs / atr14
+
+    # atr expansion: ATR(14) now vs ATR(14) ending 15 bars ago
+    if len(bars) >= 30:
+        atr_prev = _atr(bars[:-15], 14)
+        if atr_prev > 0:
+            comp["atr_expand"] = atr14 / atr_prev
+
+    # intraday move: arm bar close vs session open, normalized by atr14
+    session_open = bars[0].open
+    if atr14 > 0 and session_open > 0:
+        move = (arm_bar.close - session_open) / atr14
+        # Long wants positive move, short wants negative.
+        comp["intraday"] = move if direction.value == "long" else -move
+
+    # gap: session open vs prior-day close (only if caller provided)
+    if prior_day_close and prior_day_close > 0 and session_open > 0:
+        gap = (session_open - prior_day_close) / prior_day_close
+        comp["gap"] = gap if direction.value == "long" else -gap
+
+    # Composite: sum of standardized-ish components. Weights chosen to put
+    # each component on a comparable scale (relvol and intraday tend to be
+    # O(1-10); push O(0-3); atr_expand O(0.5-2); gap O(0.0-0.15)).
+    score = (
+        1.0 * comp["relvol"]
+        + 2.0 * comp["push"]
+        + 1.5 * comp["atr_expand"]
+        + 1.0 * comp["intraday"]
+        + 10.0 * comp["gap"]
+    )
+    return score, comp

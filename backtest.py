@@ -38,16 +38,13 @@ from strategy import (
     CatalystLong,
     CatalystShort,
     Direction,
-    LevelToLevelLong,
-    LevelToLevelShort,
     ORBState,
     ResetSignal,
     RunnerLong,
     RunnerShort,
-    SectorRotationLong,
-    SectorRotationShort,
     VWAPSnapbackLong,
     VWAPSnapbackShort,
+    compute_signal_score,
     min_stop_dist,
     position_size,
 )
@@ -95,6 +92,32 @@ BLOCKED_TICKERS = {s.strip().upper() for s in os.environ.get("BLOCKED_TICKERS", 
 # universe were profitable in the 20-day window. Set OPENING_BLOCK_END_ET
 # to e.g. "09:45" or "10:00" to enable.
 OPENING_BLOCK_END = _parse_et("OPENING_BLOCK_END_ET", time(9, 30))
+
+# ---------------------------------------------------------------------------
+# experiment/tune-v1 knobs
+# ---------------------------------------------------------------------------
+# Change #2: per-strategy position-size multipliers. 1.5x ORB, 0.5x Runner
+# (long and short). LevelToLevel (long/short) was dropped from the codebase
+# in commit 2c1babc, so only Runner applies among the "0.5x" group.
+STRATEGY_SIZE_MULT: dict[str, float] = {
+    "ORBState": 1.5,
+    "RunnerLong": 0.5,
+    "RunnerShort": 0.5,
+    # "LevelToLevelLong": 0.5, "LevelToLevelShort": 0.5,  # classes no longer exist
+}
+
+# Change #3: ORB-specific partial-TP fraction (33% closes at TP, 67% trails).
+# All other strategies still use 50/50.
+ORB_TP_FRAC = float(os.environ.get("ORB_TP_FRAC", 1.0 / 3.0))
+
+# Change #1: top-quartile signal-quality filter.
+# Two modes, controlled by env vars (both are off by default):
+#   COLLECT_SIGNALS_ONLY=1   -> arm-path logs every candidate signal's score
+#                               and immediately resets to watching. No fills.
+#                               run_backtest() returns 'candidate_signals'.
+#   MIN_SIGNAL_SCORE=<float> -> signals whose score < threshold are rejected.
+# Typical usage: wrapper runs pass 1 with COLLECT_SIGNALS_ONLY, computes the
+# 75th-percentile score, reruns with MIN_SIGNAL_SCORE set.
 
 
 def _in_opening_block(ts_utc: datetime) -> bool:
@@ -198,11 +221,8 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         end_et = now_et
 
     feed = DataFeed[os.environ.get("FEED", "IEX").upper()]
-    # Always include SPY in the minute-bar fetch so SectorRotation states
-    # can gate on a flat-index condition.
-    minute_symbols = list({*watchlist.keys(), "SPY"})
     req = StockBarsRequest(
-        symbol_or_symbols=minute_symbols,
+        symbol_or_symbols=list(watchlist.keys()),
         timeframe=TimeFrame.Minute,
         start=start_et,
         end=end_et,
@@ -255,16 +275,12 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         if d is Direction.LONG:
             states[sym] = [
                 BreakoutLongState(sym), ORBState(sym), RunnerLong(sym),
-                LevelToLevelLong(sym),
-                SectorRotationLong(sym),
                 VWAPSnapbackLong(sym),
                 CatalystLong(sym),
             ]
         else:
             states[sym] = [
                 BreakoutShortState(sym), ORBState(sym), RunnerShort(sym),
-                LevelToLevelShort(sym),
-                SectorRotationShort(sym),
                 VWAPSnapbackShort(sym),
                 CatalystShort(sym),
             ]
@@ -287,28 +303,17 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
     skipped_locked = 0
     skipped_opening = 0
     skipped_blocked = 0
+    skipped_low_score = 0
     circuit_broken = False
     realized_pnl = 0.0
 
-    # Cache references to all SectorRotation instances for fast SPY-flag updates.
-    from strategy import SectorRotationLong as _SecLong, SectorRotationShort as _SecShort
-    _sector_states = [
-        st for sts_list in states.values() for st in sts_list
-        if isinstance(st, (_SecLong, _SecShort))
-    ]
-    _spy_open: float | None = None
+    # experiment/tune-v1: signal-quality filter modes
+    collect_signals_only = os.environ.get("COLLECT_SIGNALS_ONLY", "").lower() in ("1", "true", "yes")
+    _mss = os.environ.get("MIN_SIGNAL_SCORE", "")
+    min_signal_score: float | None = float(_mss) if _mss not in ("", "none", "None") else None
+    candidate_signals: list[dict] = []  # populated when collect_signals_only
 
     for ts, ticker, b in events:
-        # SPY pseudo-event: update intraday move % on SectorRotation states,
-        # then continue (SPY isn't in the per-ticker `states` dict).
-        if ticker == "SPY":
-            if _spy_open is None:
-                _spy_open = b.open
-            if _spy_open and _spy_open > 0:
-                move_pct = (b.close - _spy_open) / _spy_open
-                for st in _sector_states:
-                    st.index_move_pct = move_pct
-            continue
         sts = states.get(ticker)
         if not sts:
             continue
@@ -368,7 +373,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         if ticker in pending:
             sig, armed_state = pending[ticker]
             filled = False
-            if sig.tag in ("l2l", "sector", "vwap_snap", "catalyst"):
+            if sig.tag in ("vwap_snap", "catalyst"):
                 # Market-on-next-bar fill (entry = bar.close of prior bar).
                 fill = b.open
                 filled = True
@@ -385,6 +390,12 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     max_deployment=MAX_DEPLOYMENT,
                     max_risk=MAX_RISK_PER_TRADE,
                 )
+                # Change #2: per-strategy size reallocation (1.5x ORB,
+                # 0.5x Runner L/S). Applied before the short/meme/regime
+                # haircuts so those still compound multiplicatively.
+                strat_mult = STRATEGY_SIZE_MULT.get(type(armed_state).__name__, 1.0)
+                if strat_mult != 1.0:
+                    qty = int(qty * strat_mult)
                 if sig.direction is Direction.SHORT:
                     qty = int(qty * SHORT_SIZE_MULT)
                 if ticker in MEME_LEVERAGED_TICKERS:
@@ -505,19 +516,26 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     or (d is Direction.SHORT and b.low <= pos["tp_level"])
                 )
                 if hit_tp:
-                    half = pos["original_qty"] // 2
+                    # Change #3: ORB takes 1/3 at TP (67% trails); every
+                    # other strategy unchanged at 50/50.
+                    if pos.get("strategy") == "ORBState":
+                        tp_qty = int(pos["original_qty"] * ORB_TP_FRAC)
+                    else:
+                        tp_qty = pos["original_qty"] // 2
+                    # guard against 0 (needs at least 1 share at TP)
+                    tp_qty = max(1, min(tp_qty, pos["original_qty"] - 1))
                     tp_pnl = (
-                        (pos["tp_level"] - pos["entry"]) * half
+                        (pos["tp_level"] - pos["entry"]) * tp_qty
                         if d is Direction.LONG
-                        else (pos["entry"] - pos["tp_level"]) * half
+                        else (pos["entry"] - pos["tp_level"]) * tp_qty
                     )
                     pos["tp_price"] = pos["tp_level"]
-                    pos["remaining_qty"] = pos["original_qty"] - half
+                    pos["remaining_qty"] = pos["original_qty"] - tp_qty
                     pos["phase"] = 2
                     pos["stop"] = pos["entry"]  # breakeven on remaining
                     pos["extreme"] = pos["tp_level"]
                     pos["_tp_pnl"] = tp_pnl
-                    pos["_tp_qty"] = half
+                    pos["_tp_qty"] = tp_qty
                     realized_pnl += tp_pnl
 
             # Phase 2: trailing stop for remaining 50%
@@ -617,6 +635,36 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         for st in sts:
             sig = st.on_bar(ib)
             if isinstance(sig, ArmSignal):
+                # experiment/tune-v1: compute signal-quality score on every
+                # candidate (before any filtering). Uses only bars the state
+                # machine has seen up to and including the arm bar.
+                try:
+                    sig.score, sig.score_components = compute_signal_score(
+                        getattr(st, "bars", []), sig.direction, sig.entry, sig.stop,
+                    )
+                except Exception:
+                    sig.score = 0.0
+                    sig.score_components = None
+
+                # Pass 1 of the top-quartile filter: log the candidate and
+                # reset. No position is taken; we just want the full
+                # per-day score distribution.
+                if collect_signals_only:
+                    candidate_signals.append({
+                        "ts": ts, "ticker": ticker, "strategy": type(st).__name__,
+                        "direction": sig.direction.value, "tag": sig.tag,
+                        "entry": sig.entry, "stop": sig.stop,
+                        "score": sig.score, "components": sig.score_components,
+                    })
+                    st.reset_to_watching()
+                    continue
+
+                # Pass 2 (or single-pass): apply threshold if set.
+                if min_signal_score is not None and sig.score < min_signal_score:
+                    skipped_low_score += 1
+                    st.reset_to_watching()
+                    continue
+
                 if circuit_broken:
                     st.reset_to_watching()
                     continue
@@ -630,7 +678,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                     continue
                 # Mid-day fade strategies (l2l, sweep, sector) are DESIGNED
                 # for the chop window — don't skip them there.
-                if _in_chop(ts) and sig.tag not in ("l2l", "sector", "vwap_snap", "catalyst"):
+                if _in_chop(ts) and sig.tag not in ("vwap_snap", "catalyst"):
                     skipped_chop += 1
                     st.reset_to_watching()
                     continue
@@ -742,9 +790,11 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
         "skipped_locked": skipped_locked,
         "skipped_opening": skipped_opening,
         "skipped_blocked": skipped_blocked,
+        "skipped_low_score": skipped_low_score,
         "regime_reduced": regime_reduced,
         "circuit_broken": circuit_broken,
         "trades": trades,
+        "candidate_signals": candidate_signals,  # populated only if COLLECT_SIGNALS_ONLY
     }
 
 
