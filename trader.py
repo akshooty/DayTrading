@@ -447,6 +447,17 @@ class BreakoutTrader:
                 self.entry_orders.pop(sym, None)
                 if st.state is State.ARMED:
                     st.reset_to_watching()
+                return
+            # Exit order (stop / TP / trail) went terminal without a
+            # full fill. Any shares that DID fill are booked, the rest
+            # are flattened at market, and an alert email is sent.
+            pos = self.positions.get(sym)
+            if pos is None:
+                return
+            is_tp = (oid == pos.get("tp_order_id"))
+            is_stop = (oid == pos.get("stop_order_id"))
+            if is_tp or is_stop:
+                await self._handle_exit_failure(st, sym, pos, oid, msg.event, is_tp)
 
     async def _handle_entry_fill(self, st: BreakoutState, order) -> None:
         sym = order.symbol
@@ -789,6 +800,91 @@ class BreakoutTrader:
             "\n".join(lines) + "\n",
         )
 
+    async def _handle_exit_failure(
+        self, st: BreakoutState, sym: str, pos: dict,
+        oid: str, event_name: str, is_tp: bool,
+    ) -> None:
+        """Exit order terminated without fully filling (canceled / expired
+        / rejected / done_for_day). Book any partial that went through,
+        flatten the remainder at market, and alert.
+        """
+        # Re-query for the authoritative filled_qty / fill_price.
+        filled_qty = 0
+        fill_price = 0.0
+        try:
+            o = self._confirm_order(oid)
+            filled_qty = int(float(getattr(o, "filled_qty", 0) or 0))
+            fill_price = float(getattr(o, "filled_avg_price", 0) or 0)
+        except Exception as e:
+            log.error("%s exit-fail re-query failed: %s", sym, e)
+
+        d = pos["direction"]
+        is_long = d is Direction.LONG
+
+        # Book any partial fill that already went through, so
+        # remaining_qty reflects what we still actually hold.
+        if filled_qty > 0 and fill_price > 0:
+            partial_pnl = (
+                (fill_price - pos["entry"]) * filled_qty if is_long
+                else (pos["entry"] - fill_price) * filled_qty
+            )
+            if is_tp:
+                pos["tp_pnl"] = (pos.get("tp_pnl", 0.0) or 0.0) + partial_pnl
+                pos["tp_fill_price"] = fill_price
+                pos["tp_fill_qty"] = (pos.get("tp_fill_qty", 0) or 0) + filled_qty
+            else:
+                self.realized_pnl += partial_pnl
+            pos["remaining_qty"] -= filled_qty
+            log.warning(
+                "%s exit partial booked: %d @ $%.2f pnl=$%+.2f; remaining=%d",
+                sym, filled_qty, fill_price, partial_pnl, pos["remaining_qty"],
+            )
+
+        # Clear the dead order reference.
+        if is_tp:
+            pos["tp_order_id"] = None
+        else:
+            pos["stop_order_id"] = None
+
+        remaining = pos["remaining_qty"]
+        if remaining <= 0:
+            log.info("%s exit %s %s; position was fully flat from partial", sym, oid, event_name)
+            st.on_exit_filled()
+            self.positions.pop(sym, None)
+            return
+
+        exit_side = OrderSide.SELL if is_long else OrderSide.BUY
+        log.error(
+            "%s exit %s %s; flattening remaining %d at market",
+            sym, oid, event_name, remaining,
+        )
+        new_oid = None
+        if not self.dry_run:
+            try:
+                new_order = self.trading.submit_order(MarketOrderRequest(
+                    symbol=sym, qty=remaining, side=exit_side,
+                    time_in_force=TimeInForce.DAY,
+                ))
+                new_oid = str(new_order.id)
+                # Track the new market order so the eventual fill event
+                # routes through _handle_exit_fill normally.
+                pos["stop_order_id"] = new_oid
+            except Exception as e:
+                log.error("%s emergency flatten submit failed: %s", sym, e)
+
+        await _email(
+            f"[Algo] {sym}: EXIT RETRY",
+            (
+                f"Symbol:        {sym}\n"
+                f"Failed order:  {oid} ({event_name})\n"
+                f"Partial fill:  {filled_qty} @ ${fill_price:.2f}\n"
+                f"Action:        market order for remaining {remaining} shares\n"
+                f"New order:     {new_oid or '(submit failed — check manually)'}\n"
+                f"Day P&L:       ${self.realized_pnl:+,.2f}\n"
+                f"Time:          {datetime.now(EASTERN).isoformat()}\n"
+            ),
+        )
+
     async def eod_closeout(self) -> None:
         log.info("EOD closeout — day_pnl=$%.2f locked_out=%d", self.realized_pnl, len(self.locked_out))
         if self.dry_run:
@@ -797,10 +893,84 @@ class BreakoutTrader:
             self.trading.cancel_orders()
         except Exception as e:
             log.warning("cancel_orders failed: %s", e)
+
+        for attempt in range(1, 4):
+            try:
+                self.trading.close_all_positions(cancel_orders=True)
+                log.info("EOD close_all_positions submitted (attempt %d)", attempt)
+            except Exception as e:
+                log.warning("close_all_positions attempt %d failed: %s", attempt, e)
+            await asyncio.sleep(2)
+            try:
+                positions = self.trading.get_all_positions()
+                if not positions:
+                    log.info("EOD flat confirmed after attempt %d", attempt)
+                    return
+                log.warning(
+                    "EOD attempt %d: %d positions still open: %s",
+                    attempt, len(positions),
+                    [f"{p.symbol} ({p.qty})" for p in positions],
+                )
+            except Exception as e:
+                log.warning("EOD position-check failed: %s", e)
+
+        # Still not flat after 3 retries — alert for manual intervention.
+        log.error("EOD closeout FAILED after 3 attempts — manual check required")
         try:
-            self.trading.close_all_positions(cancel_orders=True)
-        except Exception as e:
-            log.warning("close_all_positions failed: %s", e)
+            positions = self.trading.get_all_positions()
+            still = [f"{p.symbol} qty={p.qty}" for p in positions]
+        except Exception:
+            still = ["(unable to query)"]
+        await _email(
+            "[Algo] EOD CLOSE FAILED",
+            (
+                f"EOD closeout could not flatten all positions after 3 retries.\n"
+                f"Positions still open: {still}\n"
+                f"Day P&L:  ${self.realized_pnl:+,.2f}\n"
+                f"Time:     {datetime.now(EASTERN).isoformat()}\n"
+                f"\n"
+                f"Check Alpaca manually and flatten.\n"
+            ),
+        )
+
+    async def _reconcile_loop(self, interval_sec: int = 30) -> None:
+        """Compare local positions against Alpaca every `interval_sec` and
+        alert on drift. Catches cases where a stream event was lost or an
+        order filled without our knowledge.
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval_sec)
+            except asyncio.CancelledError:
+                return
+            try:
+                alpaca_pos = {
+                    p.symbol: abs(int(float(p.qty)))
+                    for p in self.trading.get_all_positions()
+                }
+            except Exception as e:
+                log.warning("reconcile: get_all_positions failed: %s", e)
+                continue
+            local_pos = {
+                s: int(p.get("remaining_qty", 0) or 0)
+                for s, p in self.positions.items()
+            }
+            drift = []
+            for s in sorted(set(alpaca_pos) | set(local_pos)):
+                a = alpaca_pos.get(s, 0)
+                l = local_pos.get(s, 0)
+                if a != l:
+                    drift.append(f"{s}: local={l} alpaca={a}")
+            if drift:
+                log.error("RECONCILE DRIFT: %s", drift)
+                await _email(
+                    "[Algo] RECONCILE DRIFT",
+                    (
+                        f"Local vs Alpaca position drift detected:\n"
+                        + "\n".join(f"  {d}" for d in drift)
+                        + f"\n\nTime: {datetime.now(EASTERN).isoformat()}\n"
+                    ),
+                )
 
     async def run(self) -> None:
         acct = self.trading.get_account()
@@ -841,6 +1011,7 @@ class BreakoutTrader:
         data_task = asyncio.create_task(self.data_stream._run_forever())
         trade_task = asyncio.create_task(self.trade_stream._run_forever())
         timer_task = asyncio.create_task(asyncio.sleep(wait_s))
+        reconcile_task = asyncio.create_task(self._reconcile_loop(30))
 
         try:
             _, pending = await asyncio.wait(
@@ -849,6 +1020,7 @@ class BreakoutTrader:
             )
             for t in pending:
                 t.cancel()
+            reconcile_task.cancel()
         finally:
             await self.eod_closeout()
             try:
