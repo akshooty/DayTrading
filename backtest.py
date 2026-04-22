@@ -110,6 +110,29 @@ STRATEGY_SIZE_MULT: dict[str, float] = {
 # All other strategies still use 50/50.
 ORB_TP_FRAC = float(os.environ.get("ORB_TP_FRAC", 1.0 / 3.0))
 
+# Slippage (in basis points). Applied at fill time in the unfavorable
+# direction to model bid-ask spread + market-impact reality:
+#   ENTRY: longs pay slightly more, shorts receive slightly less
+#   EXIT (stop / trail): longs sell slightly lower, shorts cover slightly higher
+# TP-hit fills are limit orders — no slippage applied; they fill at the
+# limit or better by definition.
+# Defaults: 5 bps entry, 15 bps stop-out (stops convert to market on trigger).
+SLIPPAGE_ENTRY_BPS = float(os.environ.get("SLIPPAGE_ENTRY_BPS", 5))
+SLIPPAGE_STOP_BPS = float(os.environ.get("SLIPPAGE_STOP_BPS", 15))
+
+
+def _slip_entry(price: float, direction: Direction) -> float:
+    bps = SLIPPAGE_ENTRY_BPS / 10000.0
+    return price * (1 + bps) if direction is Direction.LONG else price * (1 - bps)
+
+
+def _slip_stop(price: float, direction: Direction) -> float:
+    """Slip a stop-out / trail exit in the unfavorable direction.
+    Long: sell lower than the stop. Short: cover higher than the stop."""
+    bps = SLIPPAGE_STOP_BPS / 10000.0
+    return price * (1 - bps) if direction is Direction.LONG else price * (1 + bps)
+
+
 # Change #1: top-quartile signal-quality filter.
 # Two modes, controlled by env vars (both are off by default):
 #   COLLECT_SIGNALS_ONLY=1   -> arm-path logs every candidate signal's score
@@ -338,7 +361,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
             if ticker in positions:
                 pos = positions[ticker]
                 d = pos["direction"]
-                exit_px = b.open
+                exit_px = _slip_stop(b.open, d)  # market-on-close slippage
                 final_qty = pos["remaining_qty"]
                 final_pnl = (
                     (exit_px - pos["entry"]) * final_qty
@@ -385,6 +408,8 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                 filled = True
 
             if filled:
+                # Apply entry slippage (bps in unfavorable direction).
+                fill = _slip_entry(fill, sig.direction)
                 qty = position_size(
                     sig.entry, sig.stop,
                     max_deployment=MAX_DEPLOYMENT,
@@ -476,9 +501,9 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                 )
                 exit_px = None
                 if hit_hard:
-                    exit_px = pos["_hard_tp_target"]
+                    exit_px = pos["_hard_tp_target"]  # limit fill — exact
                 elif hit_stop:
-                    exit_px = pos["initial_stop"]
+                    exit_px = _slip_stop(pos["initial_stop"], d)  # stop slippage
                 if exit_px is not None:
                     pnl = (
                         (exit_px - pos["entry"]) * pos["original_qty"]
@@ -591,7 +616,7 @@ def run_backtest(print_report: bool = True, starting_pnl: float = 0.0) -> dict:
                 exited = b.high >= pos["stop"]
 
             if exited:
-                exit_px = pos["stop"]
+                exit_px = _slip_stop(pos["stop"], d)  # stop/trail slippage
                 final_qty = pos["remaining_qty"]
                 final_pnl = (
                     (exit_px - pos["entry"]) * final_qty

@@ -146,7 +146,11 @@ class BreakoutTrader:
         key = os.environ["ALPACA_API_KEY"].strip()
         secret = os.environ["ALPACA_SECRET_KEY"].strip()
         self.trading = TradingClient(key, secret, paper=True)
-        self.data_stream = StockDataStream(key, secret)
+        feed_name = os.environ.get("FEED", "SIP").upper()
+        self.data_stream = StockDataStream(
+            key, secret,
+            feed=__import__("alpaca.data.enums", fromlist=["DataFeed"]).DataFeed[feed_name],
+        )
         self.trade_stream = TradingStream(key, secret, paper=True)
         self.data_client = StockHistoricalDataClient(key, secret)
         self.states: dict[str, BreakoutState] = {}
@@ -974,6 +978,80 @@ class BreakoutTrader:
                     ),
                 )
 
+    def _backfill_state_machines(self, watchlist: dict) -> None:
+        """Fetch 1-min bars from session open through now via REST and
+        replay them through each ticker's state machine. Discards any
+        ArmSignals (can't retroactively place orders). Resets any state
+        machine stuck in ARMED back to WATCHING — no live order backs
+        that pending state. Only runs if we started late."""
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import DataFeed
+
+        now_et = datetime.now(EASTERN)
+        session_open_et = datetime.combine(now_et.date(), time(9, 30), tzinfo=EASTERN)
+        if now_et < session_open_et + timedelta(minutes=2):
+            log.info("backfill: started within 2 min of open — nothing to fill")
+            return
+        if now_et.time() >= time(16, 0):
+            log.info("backfill: market closed — skipping")
+            return
+
+        feed_name = os.environ.get("FEED", "SIP").upper()
+        symbols = list(watchlist.keys())
+        req = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Minute,
+            start=session_open_et,
+            end=now_et - timedelta(minutes=1),  # skip in-progress bar
+            feed=DataFeed[feed_name],
+        )
+        resp = self.data_client.get_stock_bars(req)
+        total_bars = sum(len(bars) for bars in resp.data.values())
+        log.info(
+            "backfill: fetched %d bars across %d/%d tickers from %s to %s (feed=%s)",
+            total_bars, len(resp.data), len(symbols),
+            session_open_et.strftime("%H:%M"),
+            (now_et - timedelta(minutes=1)).strftime("%H:%M"),
+            feed_name,
+        )
+
+        # Merge bars across tickers and sort by timestamp so the per-ticker
+        # state machines see a consistent chronological order (important if
+        # any state machine reads across tickers — they don't today, but
+        # future-proof).
+        events = []
+        for sym, bars in resp.data.items():
+            for b in bars:
+                events.append((b.timestamp, sym, b))
+        events.sort(key=lambda x: x[0])
+
+        signals_discarded = 0
+        for ts, sym, b in events:
+            st = self.states.get(sym)
+            if not st:
+                continue
+            ib = Bar(
+                open=float(b.open), high=float(b.high),
+                low=float(b.low), close=float(b.close),
+                volume=float(b.volume), timestamp=b.timestamp,
+            )
+            sig = st.on_bar(ib)
+            if sig is not None:
+                signals_discarded += 1
+
+        # Any state machine ARMED from backfill has no live pending
+        # order — reset to WATCHING so live bars re-evaluate cleanly.
+        reset_count = 0
+        for sym, st in self.states.items():
+            if st.state is State.ARMED:
+                st.reset_to_watching()
+                reset_count += 1
+        log.info(
+            "backfill complete: discarded %d signals, reset %d ARMED state machines",
+            signals_discarded, reset_count,
+        )
+
     async def run(self) -> None:
         acct = self.trading.get_account()
         self.equity = float(acct.equity)
@@ -1001,6 +1079,18 @@ class BreakoutTrader:
                 self.states[sym] = BreakoutLongState(symbol=sym)
             else:
                 self.states[sym] = BreakoutShortState(symbol=sym)
+
+        # Backfill: if we started late (after market open), fetch the
+        # 1-min bars from 9:30 ET through now and replay them through
+        # every state machine so HODs, EMAs, volume avgs, and pattern
+        # history reflect the real session. Any ArmSignals fired during
+        # backfill are DISCARDED — we can't place orders for past bars.
+        # After backfill, reset any state machine left in ARMED back to
+        # WATCHING (the pending-order state has no live order behind it).
+        try:
+            self._backfill_state_machines(watchlist)
+        except Exception as e:
+            log.warning("backfill failed (%s) — proceeding without history", e)
 
         self.data_stream.subscribe_bars(self.on_bar, *watchlist.keys())
         self.trade_stream.subscribe_trade_updates(self.on_trade_update)
