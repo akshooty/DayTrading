@@ -61,9 +61,16 @@ from strategy import (
     BreakoutLongState,
     BreakoutShortState,
     BreakoutState,
+    CatalystLong,
+    CatalystShort,
     Direction,
+    ORBState,
     ResetSignal,
+    RunnerLong,
+    RunnerShort,
     State,
+    VWAPSnapbackLong,
+    VWAPSnapbackShort,
     min_stop_dist,
     position_size,
 )
@@ -83,6 +90,10 @@ LOCKOUT_LOSS = float(os.environ.get("LOCKOUT_LOSS", 0))  # 0 => any losing close
 HYBRID_TP_PCT = float(os.environ.get("HYBRID_TP_PCT", 4))
 HYBRID_ATR_PERIOD = int(os.environ.get("HYBRID_ATR_PERIOD", 14))
 HYBRID_ATR_MULT = float(os.environ.get("HYBRID_ATR_MULT", 1.5))
+# ORB-specific partial-TP fraction (mirrors backtest.py). ORB keeps 2/3
+# of the position after TP1 to ride the trail — its win rate is high
+# enough that more size through the trail compounds meaningfully.
+ORB_TP_FRAC = float(os.environ.get("ORB_TP_FRAC", 1.0 / 3.0))
 
 # Tradervue-log insights (mirrored from backtest.py).
 SHORT_SIZE_MULT = float(os.environ.get("SHORT_SIZE_MULT", 1.0))
@@ -153,8 +164,12 @@ class BreakoutTrader:
         )
         self.trade_stream = TradingStream(key, secret, paper=True)
         self.data_client = StockHistoricalDataClient(key, secret)
-        self.states: dict[str, BreakoutState] = {}
-        self.entry_orders: dict[str, str] = {}
+        # Per-ticker LIST of state machines (matches backtest.py).
+        # One ARM wins the position slot; others see entry_orders/positions
+        # and self-reject via the busy-check in _handle_arm.
+        self.states: dict[str, list[BreakoutState]] = {}
+        # sym -> (order_id, owning_state_machine).
+        self.entry_orders: dict[str, tuple[str, BreakoutState]] = {}
         self.positions: dict[str, dict] = {}
         self.locked_out: set[str] = set()
         self.equity: float = 0.0
@@ -219,62 +234,65 @@ class BreakoutTrader:
         return out
 
     async def on_bar(self, bar) -> None:
-        st = self.states.get(bar.symbol)
-        if not st:
+        sts = self.states.get(bar.symbol)
+        if not sts:
             return
         ib = Bar(
             open=float(bar.open), high=float(bar.high),
             low=float(bar.low), close=float(bar.close),
             volume=float(bar.volume), timestamp=bar.timestamp,
         )
-        sig = st.on_bar(ib)
-        log.debug(
-            "%s dir=%s bar h=%.2f l=%.2f state=%s",
-            bar.symbol, st.direction.value, bar.high, bar.low, st.state.value,
-        )
-        if isinstance(sig, ArmSignal):
-            await self._handle_arm(sig)
-        elif isinstance(sig, ResetSignal):
-            await self._handle_reset(sig)
+        # Drive each state machine in order; first to emit ArmSignal wins
+        # the position slot (the busy-check in _handle_arm rejects the
+        # rest for this ticker until the position closes).
+        for st in sts:
+            sig = st.on_bar(ib)
+            if isinstance(sig, ArmSignal):
+                await self._handle_arm(sig, st)
+            elif isinstance(sig, ResetSignal):
+                await self._handle_reset(sig, st)
 
     def _in_chop_now(self) -> bool:
         t = datetime.now(EASTERN).time()
         return CHOP_START <= t < CHOP_END
 
-    async def _handle_arm(self, s: ArmSignal) -> None:
+    async def _handle_arm(self, s: ArmSignal, armed_state: BreakoutState) -> None:
+        """Handle an ArmSignal emitted by `armed_state` on ticker `s.symbol`.
+        Only this specific state machine is reset on skip; the other
+        state machines on the same ticker continue watching independently.
+        """
+        strat = type(armed_state).__name__
         if self.circuit_broken:
-            log.info("%s ARM skipped (circuit breaker)", s.symbol)
-            self.states[s.symbol].reset_to_watching()
+            log.info("%s %s ARM skipped (circuit breaker)", s.symbol, strat)
+            armed_state.reset_to_watching()
             return
         if s.symbol in BLOCKED_TICKERS:
-            log.info("%s ARM skipped (blocked ticker)", s.symbol)
-            self.states[s.symbol].reset_to_watching()
+            log.info("%s %s ARM skipped (blocked ticker)", s.symbol, strat)
+            armed_state.reset_to_watching()
             return
-        # Don't double up: if the ticker has a pending entry order or an
-        # open position, skip this new arm. A prior entry that was
-        # cancelled will have been popped from entry_orders by the
-        # trade-update handler once Alpaca confirmed terminal status,
-        # so this check allows legitimate re-entries on fresh setups.
         if s.symbol in self.entry_orders:
-            log.info("%s ARM skipped (entry order already pending)", s.symbol)
-            self.states[s.symbol].reset_to_watching()
+            log.info("%s %s ARM skipped (entry order already pending)", s.symbol, strat)
+            armed_state.reset_to_watching()
             return
         if s.symbol in self.positions:
-            log.info("%s ARM skipped (position already open)", s.symbol)
-            self.states[s.symbol].reset_to_watching()
+            log.info("%s %s ARM skipped (position already open)", s.symbol, strat)
+            armed_state.reset_to_watching()
             return
-        if self._in_chop_now():
-            log.info("%s ARM skipped (11:30-14:00 ET chop window)", s.symbol)
-            self.states[s.symbol].reset_to_watching()
+        # Mid-day fade strategies (vwap_snap, catalyst) are DESIGNED
+        # for the chop window — don't skip them there.
+        chop_exempt = s.tag in ("vwap_snap", "catalyst")
+        if self._in_chop_now() and not chop_exempt:
+            log.info("%s %s ARM skipped (11:30-14:00 ET chop window)", s.symbol, strat)
+            armed_state.reset_to_watching()
             return
         if s.symbol in self.locked_out:
-            log.info("%s ARM skipped (locked out — prior losing close)", s.symbol)
-            self.states[s.symbol].reset_to_watching()
+            log.info("%s %s ARM skipped (locked out — prior losing close)", s.symbol, strat)
+            armed_state.reset_to_watching()
             return
         busy = len(self.entry_orders) + len(self.positions)
         if busy >= MAX_CONCURRENT:
-            log.info("%s ARM skipped (at cap %d)", s.symbol, MAX_CONCURRENT)
-            self.states[s.symbol].reset_to_watching()
+            log.info("%s %s ARM skipped (at cap %d)", s.symbol, strat, MAX_CONCURRENT)
+            armed_state.reset_to_watching()
             return
 
         qty = position_size(
@@ -293,21 +311,47 @@ class BreakoutTrader:
             qty = int(qty * REGIME_SIZE_MULT)
             size_factors.append(f"regime x{REGIME_SIZE_MULT}")
         if qty < 2:
-            log.warning("%s ARM skipped — qty %d (need >= 2 for hybrid TP)", s.symbol, qty)
-            self.states[s.symbol].reset_to_watching()
+            log.warning("%s %s ARM skipped — qty %d (need >= 2 for hybrid TP)",
+                        s.symbol, strat, qty)
+            armed_state.reset_to_watching()
             return
         if size_factors:
             log.info("%s size adjustments: %s -> qty=%d", s.symbol, ", ".join(size_factors), qty)
 
         log.info(
-            "%s ARM dir=%s entry=%.2f stop=%.2f qty=%d deploy=$%.2f",
-            s.symbol, s.direction.value, s.entry, s.stop, qty, qty * s.entry,
+            "%s %s ARM dir=%s entry=%.2f stop=%.2f qty=%d deploy=$%.2f tag=%s",
+            s.symbol, strat, s.direction.value, s.entry, s.stop,
+            qty, qty * s.entry, s.tag or "-",
         )
 
         if self.dry_run:
             return
 
-        if s.direction is Direction.LONG:
+        # Market-on-next-bar fill semantics for "fade" tags (l2l, sweep,
+        # sector were removed; vwap_snap + catalyst remain). We simulate
+        # this live with a MarketOrderRequest instead of stop-limit — the
+        # entry is "right now" at current bid/ask, not a trigger level.
+        if s.tag in ("vwap_snap", "catalyst"):
+            if s.direction is Direction.LONG:
+                req = MarketOrderRequest(
+                    symbol=s.symbol, qty=qty, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                )
+            else:
+                try:
+                    asset = self.trading.get_asset(s.symbol)
+                    if not getattr(asset, "shortable", False):
+                        log.info("%s not shortable — skipping", s.symbol)
+                        armed_state.reset_to_watching()
+                        return
+                except Exception as e:
+                    log.warning("%s asset lookup failed: %s", s.symbol, e)
+                    return
+                req = MarketOrderRequest(
+                    symbol=s.symbol, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+        elif s.direction is Direction.LONG:
             req = StopLimitOrderRequest(
                 symbol=s.symbol, qty=qty, side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
@@ -319,7 +363,7 @@ class BreakoutTrader:
                 asset = self.trading.get_asset(s.symbol)
                 if not getattr(asset, "shortable", False):
                     log.info("%s not shortable — skipping", s.symbol)
-                    self.states[s.symbol].reset_to_watching()
+                    armed_state.reset_to_watching()
                     return
             except Exception as e:
                 log.warning("%s asset lookup failed: %s", s.symbol, e)
@@ -332,7 +376,11 @@ class BreakoutTrader:
             )
 
         order = self.trading.submit_order(req)
-        self.entry_orders[s.symbol] = str(order.id)
+        # Track the owning state machine + original ArmSignal so
+        # on_trade_update routes the fill back to THIS strategy and
+        # sizing uses sig.stop / sig.target (not Breakout-specific
+        # attributes that don't exist on ORB/Runner/Catalyst).
+        self.entry_orders[s.symbol] = (str(order.id), armed_state, s)
 
     def _confirm_order(self, order_id: str):
         """Re-query Alpaca for the authoritative order state.
@@ -342,16 +390,20 @@ class BreakoutTrader:
         """
         return self.trading.get_order_by_id(order_id)
 
-    async def _handle_reset(self, s: ResetSignal) -> None:
-        log.info("%s RESET dir=%s (setup invalidated)", s.symbol, s.direction.value)
-        # Do NOT pop entry_orders here. If the cancel races with a fill
-        # (order already filling at Alpaca when we sent the cancel), the
-        # subsequent "fill" / "canceled" trade event must still match
-        # entry_orders[sym] so exits get sized for any real shares owned.
-        # The trade-update handler pops entry_orders once the order is
-        # in a terminal state.
-        oid = self.entry_orders.get(s.symbol)
-        if not oid or self.dry_run:
+    async def _handle_reset(self, s: ResetSignal, reset_state: BreakoutState) -> None:
+        """Handle ResetSignal from a specific state machine. Only cancel
+        the pending entry if THIS state machine owns it; a reset from a
+        different strategy on the same ticker must not interfere with
+        another strategy's live order."""
+        strat = type(reset_state).__name__
+        log.info("%s %s RESET dir=%s (setup invalidated)",
+                 s.symbol, strat, s.direction.value)
+        entry = self.entry_orders.get(s.symbol)
+        if not entry or self.dry_run:
+            return
+        oid, owner, _sig = entry
+        if owner is not reset_state:
+            # Another strategy's order is pending — leave it alone.
             return
         await self._confirm_cancel(s.symbol, oid)
 
@@ -416,27 +468,33 @@ class BreakoutTrader:
         order = msg.order
         sym = order.symbol
         oid = str(order.id)
-        st = self.states.get(sym)
-        if not st:
+        sts = self.states.get(sym)
+        if not sts:
             return
 
+        # Resolve owner + original ArmSignal. Entry orders store both;
+        # exit orders recover owner from pos["_owner"] (the sig is in the
+        # position dict fields we stashed at entry-fill time).
+        entry = self.entry_orders.get(sym)
+        owner_state: BreakoutState | None = None
+        owner_sig: ArmSignal | None = None
+        if entry and oid == entry[0]:
+            _oid, owner_state, owner_sig = entry
+
         if msg.event == "fill":
-            if oid == self.entry_orders.get(sym):
-                await self._handle_entry_fill(st, order)
+            if entry and oid == entry[0]:
+                await self._handle_entry_fill(owner_state, owner_sig, order)
                 return
             pos = self.positions.get(sym)
             if pos is None:
                 return
+            pos_owner = pos.get("_owner")
             if oid == pos.get("tp_order_id"):
-                await self._handle_tp1_fill(st, order, pos)
+                await self._handle_tp1_fill(pos_owner, order, pos)
             elif oid == pos.get("stop_order_id"):
-                await self._handle_exit_fill(st, order, pos)
+                await self._handle_exit_fill(pos_owner, order, pos)
         elif msg.event in ("canceled", "expired", "rejected", "done_for_day"):
-            if oid == self.entry_orders.get(sym):
-                # Entry terminated non-fill. If it accrued any partial
-                # fills, we own shares that need protection — route
-                # through the normal fill path so exits get sized to the
-                # partial qty. Else clear state.
+            if entry and oid == entry[0]:
                 partial = None
                 try:
                     partial = self._confirm_order(oid)
@@ -448,24 +506,29 @@ class BreakoutTrader:
                         "%s entry %s with partial fill qty=%d — placing exits for partial",
                         sym, msg.event, partial_qty,
                     )
-                    await self._handle_entry_fill(st, partial)
+                    await self._handle_entry_fill(owner_state, owner_sig, partial)
                     return
                 self.entry_orders.pop(sym, None)
-                if st.state is State.ARMED:
-                    st.reset_to_watching()
+                if owner_state is not None and owner_state.state is State.ARMED:
+                    owner_state.reset_to_watching()
                 return
-            # Exit order (stop / TP / trail) went terminal without a
-            # full fill. Any shares that DID fill are booked, the rest
-            # are flattened at market, and an alert email is sent.
+            # Exit order (stop / TP / trail) went terminal without a full fill.
             pos = self.positions.get(sym)
             if pos is None:
                 return
             is_tp = (oid == pos.get("tp_order_id"))
             is_stop = (oid == pos.get("stop_order_id"))
             if is_tp or is_stop:
-                await self._handle_exit_failure(st, sym, pos, oid, msg.event, is_tp)
+                await self._handle_exit_failure(
+                    owner_state or pos.get("_owner"), sym, pos, oid, msg.event, is_tp,
+                )
 
-    async def _handle_entry_fill(self, st: BreakoutState, order) -> None:
+    async def _handle_entry_fill(
+        self,
+        st: BreakoutState,
+        sig: ArmSignal | None,
+        order,
+    ) -> None:
         sym = order.symbol
         oid = str(order.id)
         # Before sizing any exits, re-query Alpaca for the authoritative
@@ -509,15 +572,31 @@ class BreakoutTrader:
             return
 
         atr = _compute_atr(st.bars, HYBRID_ATR_PERIOD)
-        half = filled // 2
-        if st.direction is Direction.LONG:
-            assert isinstance(st, BreakoutLongState)
-            tp_level = round(price * (1 + HYBRID_TP_PCT / 100), 2)
-            initial_stop = round(st.pullback_low, 2)
+        # ORB exits 33% at TP (higher win rate, want to keep more in the
+        # trail). All other strategies split 50/50.
+        tp_fraction = ORB_TP_FRAC if isinstance(st, ORBState) else 0.5
+        half = max(int(filled * tp_fraction), 1) if filled >= 2 else filled // 2
+
+        # Pull stop / target from the ArmSignal that produced this trade.
+        # Works for every state machine type (Breakout/ORB/Runner/
+        # VWAPSnapback/Catalyst), none of which expose a common attribute.
+        if sig is not None:
+            initial_stop = round(sig.stop, 2)
+            if sig.target is not None:
+                tp_level = round(sig.target, 2)
+            elif st.direction is Direction.LONG:
+                tp_level = round(price * (1 + HYBRID_TP_PCT / 100), 2)
+            else:
+                tp_level = round(price * (1 - HYBRID_TP_PCT / 100), 2)
         else:
-            assert isinstance(st, BreakoutShortState)
-            tp_level = round(price * (1 - HYBRID_TP_PCT / 100), 2)
-            initial_stop = round(st.bounce_high, 2)
+            # Fallback: sig was lost (e.g. process restart mid-day). Use
+            # percentage bands around fill price.
+            if st.direction is Direction.LONG:
+                tp_level = round(price * (1 + HYBRID_TP_PCT / 100), 2)
+                initial_stop = round(price * (1 - HYBRID_TP_PCT / 100), 2)
+            else:
+                tp_level = round(price * (1 - HYBRID_TP_PCT / 100), 2)
+                initial_stop = round(price * (1 + HYBRID_TP_PCT / 100), 2)
 
         pos = {
             "direction": st.direction,
@@ -531,6 +610,8 @@ class BreakoutTrader:
             "tp_pnl": 0.0,
             "stop_order_id": None,
             "tp_order_id": None,
+            "_owner": st,
+            "_strategy": type(st).__name__,
         }
         self.positions[sym] = pos
 
@@ -1028,28 +1109,40 @@ class BreakoutTrader:
 
         signals_discarded = 0
         for ts, sym, b in events:
-            st = self.states.get(sym)
-            if not st:
+            sts = self.states.get(sym)
+            if not sts:
                 continue
             ib = Bar(
                 open=float(b.open), high=float(b.high),
                 low=float(b.low), close=float(b.close),
                 volume=float(b.volume), timestamp=b.timestamp,
             )
-            sig = st.on_bar(ib)
-            if sig is not None:
-                signals_discarded += 1
+            for st in sts:
+                sig = st.on_bar(ib)
+                if sig is not None:
+                    signals_discarded += 1
 
         # Any state machine ARMED from backfill has no live pending
-        # order — reset to WATCHING so live bars re-evaluate cleanly.
+        # order. For most strategies, reset_to_watching sends it back
+        # to WATCHING so live bars re-evaluate the setup.
+        # EXCEPTION: ORBState.reset_to_watching() sets state=CLOSED
+        # (one-shot per day — don't re-arm on every subsequent bar).
+        # If backfill fired an ORB arm we discarded, we accept the
+        # miss; setting directly to WATCHING would re-arm on the next
+        # bar above range_high, which isn't a clean breakout anymore.
         reset_count = 0
-        for sym, st in self.states.items():
-            if st.state is State.ARMED:
-                st.reset_to_watching()
-                reset_count += 1
+        orb_closed_count = 0
+        for sym, sts in self.states.items():
+            for st in sts:
+                if st.state is State.ARMED:
+                    st.reset_to_watching()
+                    reset_count += 1
+                    if isinstance(st, ORBState):
+                        orb_closed_count += 1
         log.info(
-            "backfill complete: discarded %d signals, reset %d ARMED state machines",
-            signals_discarded, reset_count,
+            "backfill complete: discarded %d signals, reset %d ARMED state machines "
+            "(%d were ORB — one-shot CLOSED, not re-armable today)",
+            signals_discarded, reset_count, orb_closed_count,
         )
 
     async def run(self) -> None:
@@ -1074,11 +1167,37 @@ class BreakoutTrader:
         if not watchlist:
             log.warning("empty watchlist — exiting")
             return
+        # Per-ticker state machine list — mirrors backtest.py.
+        # Gainers (LONG side) get: BreakoutLong, ORB (either direction),
+        #   RunnerLong, VWAPSnapbackLong, CatalystLong.
+        # Losers (SHORT side) get: BreakoutShort, ORB, RunnerShort,
+        #   VWAPSnapbackShort, CatalystShort.
+        # ORB fires on whichever side breaks first (range high = LONG,
+        # range low = SHORT), so registering on either watchlist is fine.
         for sym, direction in watchlist.items():
             if direction is Direction.LONG:
-                self.states[sym] = BreakoutLongState(symbol=sym)
+                self.states[sym] = [
+                    BreakoutLongState(symbol=sym),
+                    ORBState(symbol=sym),
+                    RunnerLong(symbol=sym),
+                    VWAPSnapbackLong(symbol=sym),
+                    CatalystLong(symbol=sym),
+                ]
             else:
-                self.states[sym] = BreakoutShortState(symbol=sym)
+                self.states[sym] = [
+                    BreakoutShortState(symbol=sym),
+                    ORBState(symbol=sym),
+                    RunnerShort(symbol=sym),
+                    VWAPSnapbackShort(symbol=sym),
+                    CatalystShort(symbol=sym),
+                ]
+        # Propagate the SPY-gap regime flag to Catalyst state machines
+        # so they relax the volume threshold on news/gap days.
+        if self.regime_reduced:
+            for sts in self.states.values():
+                for st in sts:
+                    if isinstance(st, (CatalystLong, CatalystShort)):
+                        st.sky_gap_active = True
 
         # Backfill: if we started late (after market open), fetch the
         # 1-min bars from 9:30 ET through now and replay them through

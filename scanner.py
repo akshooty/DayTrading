@@ -14,11 +14,23 @@ Universe filters (post-scan):
 """
 
 import json
+import logging
 import math
+import re
 import sys
 from datetime import datetime, timezone
 
+import requests
 from finvizfinance.screener.ownership import Ownership
+
+log = logging.getLogger(__name__)
+
+_UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+    )
+}
 
 GAINER_FILTERS = {
     "Change": "Up 5%",
@@ -90,21 +102,120 @@ def _post_filter(records: list[dict]) -> list[dict]:
 
 
 def _scan(filters: dict) -> list[dict]:
-    screener = Ownership()
-    screener.set_filter(filters_dict=filters)
-    df = screener.screener_view()
-    if df is None or df.empty:
+    try:
+        screener = Ownership()
+        screener.set_filter(filters_dict=filters)
+        df = screener.screener_view()
+        if df is None or df.empty:
+            return []
+        records = df.to_dict(orient="records")
+        return _post_filter(records)
+    except Exception as e:
+        log.warning("finvizfinance scan failed: %s", e)
         return []
-    records = df.to_dict(orient="records")
-    return _post_filter(records)
+
+
+# Finviz filter-code mapping. Matches the human-readable dict above.
+_FINVIZ_CODE_GAINERS = "sh_curvol_o2,sh_float_u100,sh_price_o1,sh_relvol_o2,ta_change_u5"
+_FINVIZ_CODE_LOSERS  = "sh_curvol_o2,sh_float_u100,sh_price_o1,sh_relvol_o2,ta_change_d5"
+
+
+def _scan_finviz_http(filter_code: str) -> list[dict]:
+    """Fallback #1: hit Finviz's screener HTML directly and parse out
+    the ticker symbols. Uses no library — just regex on the response.
+    Returns bare ticker records (no Float / Volume / Short Ratio
+    fields, so _post_filter is bypassed)."""
+    try:
+        url = f"https://finviz.com/screener.ashx?v=152&f={filter_code}&ft=4"
+        r = requests.get(url, headers=_UA, timeout=10)
+        r.raise_for_status()
+        # "quote.ashx?t=SYM&" appears once per ticker row in v=152 view.
+        tickers = list(dict.fromkeys(re.findall(r"quote\.ashx\?t=([A-Z]{1,6})&", r.text)))
+        return [{"Ticker": t} for t in tickers]
+    except Exception as e:
+        log.warning("Finviz HTTP scrape failed: %s", e)
+        return []
+
+
+def _scan_yahoo(direction: str) -> list[dict]:
+    """Fallback #2: Yahoo Finance predefined day_gainers/day_losers
+    screener. Looser filters than Finviz (Yahoo's defaults are price
+    >= $5, market cap >= $1B by default) — we re-apply our own
+    price/volume/change gates in Python."""
+    scr = "day_gainers" if direction == "gainers" else "day_losers"
+    try:
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/screener/"
+            f"predefined/saved?formatted=true&lang=en-US&region=US"
+            f"&scrIds={scr}&count=100"
+        )
+        r = requests.get(url, headers=_UA, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        quotes = (
+            data.get("finance", {})
+                .get("result", [{}])[0]
+                .get("quotes", [])
+        )
+    except Exception as e:
+        log.warning("Yahoo screener fetch failed: %s", e)
+        return []
+
+    rows = []
+    for q in quotes:
+        ticker = str(q.get("symbol", "")).strip()
+        if not ticker or not ticker.isalnum():
+            continue
+        # Yahoo returns values as {"raw": 1.23, "fmt": "1.23"} when
+        # formatted=true; use .raw for numerics.
+        def _raw(field):
+            v = q.get(field)
+            if isinstance(v, dict):
+                return v.get("raw")
+            return v
+        chg = _raw("regularMarketChangePercent") or 0
+        vol = _raw("regularMarketVolume") or 0
+        price = _raw("regularMarketPrice") or 0
+        # Re-apply our Finviz-equivalent filters.
+        if price < 1.0:
+            continue
+        if vol < 2_000_000:
+            continue
+        if direction == "gainers" and chg < 5.0:
+            continue
+        if direction == "losers" and chg > -5.0:
+            continue
+        rows.append({
+            "Ticker": ticker,
+            "Change": chg,
+            "Volume": vol,
+            "Close": price,
+        })
+    return rows
+
+
+def _scan_with_fallbacks(finviz_filters: dict, finviz_code: str, direction: str) -> list[dict]:
+    """Chain: finvizfinance library -> Finviz HTTP scrape -> Yahoo.
+    Return the first non-empty result."""
+    out = _scan(finviz_filters)
+    if out:
+        return out
+    log.info("finvizfinance returned 0 tickers; falling back to Finviz HTTP scrape")
+
+    out = _scan_finviz_http(finviz_code)
+    if out:
+        return out
+    log.info("Finviz HTTP scrape returned 0 tickers; falling back to Yahoo")
+
+    return _scan_yahoo(direction)
 
 
 def scan_gainers() -> list[dict]:
-    return _scan(GAINER_FILTERS)
+    return _scan_with_fallbacks(GAINER_FILTERS, _FINVIZ_CODE_GAINERS, "gainers")
 
 
 def scan_losers() -> list[dict]:
-    return _scan(LOSER_FILTERS)
+    return _scan_with_fallbacks(LOSER_FILTERS, _FINVIZ_CODE_LOSERS, "losers")
 
 
 # Legacy alias — used by the remote scheduled agent's prompt.
